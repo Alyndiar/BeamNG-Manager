@@ -377,7 +377,11 @@ class MainWindow(QMainWindow):
             item.setData(0, LEFT_PATH_ROLE, str(self.index.beam_mods_root / name))
             self.left_tree.addTopLevelItem(item)
 
-        for pack_name in sorted(self.index.packs, key=str.lower):
+        ordered_packs = sorted(
+            self.index.packs,
+            key=lambda name: (0 if name in self.index.active_packs else 1, name.lower()),
+        )
+        for pack_name in ordered_packs:
             active = pack_name in self.index.active_packs
             item = QTreeWidgetItem([pack_name])
             item.setIcon(0, on_icon if active else off_icon)

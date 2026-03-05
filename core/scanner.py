@@ -7,6 +7,8 @@ from core import junctions
 from core.cache import ModEntry, ScanIndex, ScanTotals, UnknownJunction
 from core.utils import norm_path
 
+_SPECIAL_MODS_DIRS = {"repo", "multiplayer", "mod_manifests", "modconflictresolutions"}
+
 
 def _scan_zips_recursive(root: Path, source: str, pack_name: str | None = None) -> list[ModEntry]:
     if not root.exists() or not root.is_dir():
@@ -88,6 +90,8 @@ def build_full_index(beam_mods_root: str | Path, library_root: str | Path) -> Sc
             index.active_packs[pack_name] = target
 
     for name, target in sorted(junction_map.items(), key=lambda i: i[0].lower()):
+        if name.lower() in _SPECIAL_MODS_DIRS:
+            continue
         if name in index.packs:
             continue
         mods = _scan_zips_recursive(target, source="unknown_junction") if target.exists() else []
@@ -99,7 +103,7 @@ def build_full_index(beam_mods_root: str | Path, library_root: str | Path) -> Sc
         )
 
     for child in sorted(beam_mods.iterdir(), key=lambda p: p.name.lower()):
-        if not child.is_dir() or child.name.lower() == "repo":
+        if not child.is_dir() or child.name.lower() in _SPECIAL_MODS_DIRS:
             continue
         if junctions.is_junction(child):
             continue
@@ -126,6 +130,8 @@ def refresh_after_toggle(current: ScanIndex) -> ScanIndex:
     existing_unknown = current.unknown_junctions
     rebuilt_unknown: dict[str, UnknownJunction] = {}
     for name, target in sorted(junction_map.items(), key=lambda i: i[0].lower()):
+        if name.lower() in _SPECIAL_MODS_DIRS:
+            continue
         if name in current.packs:
             continue
         cached = existing_unknown.get(name)
