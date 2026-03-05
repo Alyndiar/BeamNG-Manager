@@ -23,7 +23,6 @@ Optional:
 ## Installation
 
 ```powershell
-cd W:\Dany\BeamNG-Manager
 python -m pip install PySide6 pytest
 ```
 
