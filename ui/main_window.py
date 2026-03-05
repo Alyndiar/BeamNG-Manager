@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QMimeData, QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QAction, QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -21,7 +22,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.actions import disable_pack, enable_pack
+from core.actions import (
+    create_pack,
+    delete_empty_pack,
+    disable_pack,
+    enable_pack,
+    move_mod_to_mods_root,
+    move_mod_to_pack,
+    rename_pack,
+)
 from core.cache import ModEntry, ModInfoCache, ScanIndex
 from core.modinfo import get_mod_info_cached, has_info_json
 from core import scanner
@@ -36,6 +45,7 @@ LEFT_PATH_ROLE = Qt.UserRole + 2
 LEFT_ACTIVE_ROLE = Qt.UserRole + 3
 
 RIGHT_PATH_ROLE = Qt.UserRole
+MOD_PATHS_MIME = "application/x-beamng-mod-paths"
 
 _VEHICLES_LINE2 = ["Name", "Brand", "Author", "Country", "Body Style", "Type", "Years", "Derby Class"]
 _VEHICLES_LINE3 = ["Description", "Slogan"]
@@ -62,6 +72,80 @@ _OTHER_LINE2 = [
     "username",
 ]
 _OTHER_LINE3 = ["Description", "Slogan", "features", "tagline"]
+
+
+class ModsTableWidget(QTableWidget):
+    def startDrag(self, supported_actions) -> None:
+        rows = self.selectionModel().selectedRows()
+        if not rows:
+            return
+        paths: list[str] = []
+        seen: set[str] = set()
+        for idx in rows:
+            cell = self.item(idx.row(), 0)
+            if cell is None:
+                continue
+            value = str(cell.data(RIGHT_PATH_ROLE))
+            if value and value not in seen:
+                seen.add(value)
+                paths.append(value)
+        if not paths:
+            return
+
+        mime = QMimeData()
+        mime.setData(MOD_PATHS_MIME, "\n".join(paths).encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction)
+
+
+class PackTreeWidget(QTreeWidget):
+    modsDropped = Signal(str, str, object)
+
+    def _drop_target_item(self, pos) -> QTreeWidgetItem | None:
+        return self.itemAt(pos)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(MOD_PATHS_MIME):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if not event.mimeData().hasFormat(MOD_PATHS_MIME):
+            super().dragMoveEvent(event)
+            return
+        item = self._drop_target_item(event.position().toPoint())
+        if item is None:
+            event.ignore()
+            return
+        kind = item.data(0, LEFT_KIND_ROLE)
+        if kind not in {"pack", "mods_root"}:
+            event.ignore()
+            return
+        self.setCurrentItem(item)
+        event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        if not event.mimeData().hasFormat(MOD_PATHS_MIME):
+            super().dropEvent(event)
+            return
+        item = self._drop_target_item(event.position().toPoint())
+        if item is None:
+            event.ignore()
+            return
+        kind = item.data(0, LEFT_KIND_ROLE)
+        if kind not in {"pack", "mods_root"}:
+            event.ignore()
+            return
+        raw = bytes(event.mimeData().data(MOD_PATHS_MIME)).decode("utf-8", errors="replace")
+        paths = [Path(v.strip()) for v in raw.splitlines() if v.strip()]
+        if not paths:
+            event.ignore()
+            return
+        name = str(item.data(0, LEFT_NAME_ROLE) or "")
+        self.modsDropped.emit(kind, name, paths)
+        event.acceptProposedAction()
 
 
 class WorkerSignals(QObject):
@@ -106,20 +190,28 @@ class MainWindow(QMainWindow):
         self._load_settings_and_maybe_scan()
 
     def _build_ui(self) -> None:
-        self.left_tree = QTreeWidget(self)
+        self.left_tree = PackTreeWidget(self)
         self.left_tree.setHeaderHidden(True)
         self.left_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.left_tree.setAcceptDrops(True)
+        self.left_tree.setDropIndicatorShown(True)
         self.left_tree.customContextMenuRequested.connect(self._show_left_context_menu)
         self.left_tree.itemSelectionChanged.connect(self._on_left_selection_changed)
         self.left_tree.itemDoubleClicked.connect(self._on_left_double_clicked)
+        self.left_tree.modsDropped.connect(self._handle_mod_drop)
 
-        self.mods_table = QTableWidget(self)
+        self.mods_table = ModsTableWidget(self)
         self.mods_table.setColumnCount(3)
         self.mods_table.setHorizontalHeaderLabels(["Filename", "Size", "info.json"])
         self.mods_table.horizontalHeader().setStretchLastSection(True)
         self.mods_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.mods_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.mods_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.mods_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.mods_table.setDragEnabled(True)
+        self.mods_table.setDragDropMode(QAbstractItemView.DragOnly)
+        self.mods_table.setDefaultDropAction(Qt.MoveAction)
+        self.mods_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.mods_table.customContextMenuRequested.connect(self._show_mod_context_menu)
         self.mods_table.itemSelectionChanged.connect(self._on_mod_selection_changed)
 
         splitter = QSplitter(Qt.Horizontal, self)
@@ -146,6 +238,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
+        packs_menu = self.menuBar().addMenu("Packs")
         tools_menu = self.menuBar().addMenu("Tools")
 
         settings_action = QAction("Settings...", self)
@@ -155,6 +248,18 @@ class MainWindow(QMainWindow):
         refresh_action = QAction("Refresh", self)
         refresh_action.triggered.connect(self.full_refresh)
         file_menu.addAction(refresh_action)
+
+        create_pack_action = QAction("Create pack...", self)
+        create_pack_action.triggered.connect(self._create_pack_dialog)
+        packs_menu.addAction(create_pack_action)
+
+        rename_pack_action = QAction("Rename selected pack...", self)
+        rename_pack_action.triggered.connect(self._rename_selected_pack_dialog)
+        packs_menu.addAction(rename_pack_action)
+
+        delete_pack_action = QAction("Delete selected empty pack...", self)
+        delete_pack_action.triggered.connect(self._delete_selected_pack)
+        packs_menu.addAction(delete_pack_action)
 
         find_dupes_action = QAction("Find duplicates...", self)
         find_dupes_action.triggered.connect(self._open_duplicates)
@@ -334,6 +439,20 @@ class MainWindow(QMainWindow):
     def _on_mod_selection_changed(self) -> None:
         rows = self.mods_table.selectionModel().selectedRows()
         if not rows:
+            items = self.left_tree.selectedItems()
+            if items:
+                self._status_for_folder(items[0], self.mods_table.rowCount())
+            return
+
+        if len(rows) > 1:
+            selected_count = len(rows)
+            displayed_count = self.mods_table.rowCount()
+            self.current_mod_path = None
+            self._set_status(
+                f"Mods sélectionnés: {selected_count} / Affichés: {displayed_count}",
+                "Sélection multiple active",
+                self.status_line3_message,
+            )
             return
 
         row = rows[0].row()
@@ -451,6 +570,9 @@ class MainWindow(QMainWindow):
 
         enable_action = menu.addAction("Enable")
         disable_action = menu.addAction("Disable")
+        menu.addSeparator()
+        rename_action = menu.addAction("Rename...")
+        delete_action = menu.addAction("Delete Empty Pack")
         enable_action.setEnabled(not active)
         disable_action.setEnabled(active)
 
@@ -467,6 +589,10 @@ class MainWindow(QMainWindow):
             self._set_status_line3(msg)
             if ok:
                 self._quick_refresh()
+        elif selected == rename_action:
+            self._rename_pack_dialog(pack_name)
+        elif selected == delete_action:
+            self._delete_pack(pack_name)
 
     def _on_left_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         del column
@@ -488,3 +614,160 @@ class MainWindow(QMainWindow):
             return
         dlg = DuplicatesDialog(self.index, self)
         dlg.exec()
+
+    def _selected_pack_name(self) -> str | None:
+        items = self.left_tree.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        if item.data(0, LEFT_KIND_ROLE) != "pack":
+            return None
+        return item.data(0, LEFT_NAME_ROLE)
+
+    def _create_pack_dialog(self) -> None:
+        name, ok = QInputDialog.getText(self, "Create Pack", "Pack name:")
+        if not ok:
+            return
+        pack_name = name.strip()
+        if not pack_name:
+            self._set_status_line3("Pack name cannot be empty.")
+            return
+        done, msg = create_pack(pack_name, self.library_root)
+        self._set_status_line3(msg)
+        if done:
+            self.full_refresh()
+
+    def _rename_selected_pack_dialog(self) -> None:
+        pack_name = self._selected_pack_name()
+        if not pack_name:
+            self._set_status_line3("Select a pack first.")
+            return
+        self._rename_pack_dialog(pack_name)
+
+    def _rename_pack_dialog(self, old_name: str) -> None:
+        new_name, ok = QInputDialog.getText(self, "Rename Pack", "New pack name:", text=old_name)
+        if not ok:
+            return
+        done, msg = rename_pack(old_name, new_name.strip(), self.beam_mods_root, self.library_root)
+        self._set_status_line3(msg)
+        if done:
+            self.full_refresh()
+
+    def _delete_selected_pack(self) -> None:
+        pack_name = self._selected_pack_name()
+        if not pack_name:
+            self._set_status_line3("Select a pack first.")
+            return
+        self._delete_pack(pack_name)
+
+    def _delete_pack(self, pack_name: str) -> None:
+        if QMessageBox.question(self, "Delete Empty Pack", f"Delete empty pack '{pack_name}'?") != QMessageBox.Yes:
+            return
+        done, msg = delete_empty_pack(pack_name, self.beam_mods_root, self.library_root)
+        self._set_status_line3(msg)
+        if done:
+            self.full_refresh()
+
+    def _selected_mod_paths(self) -> list[Path]:
+        rows = self.mods_table.selectionModel().selectedRows()
+        if not rows:
+            return []
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for idx in rows:
+            cell = self.mods_table.item(idx.row(), 0)
+            if cell is None:
+                continue
+            value = str(cell.data(RIGHT_PATH_ROLE))
+            if value and value not in seen:
+                seen.add(value)
+                paths.append(Path(value))
+        return paths
+
+    def _show_mod_context_menu(self, pos) -> None:
+        if self.index is None:
+            return
+
+        idx = self.mods_table.indexAt(pos)
+        if idx.isValid():
+            if not self.mods_table.selectionModel().isRowSelected(idx.row(), idx.parent()):
+                self.mods_table.selectRow(idx.row())
+
+        left_items = self.left_tree.selectedItems()
+        if not left_items:
+            return
+        left_item = left_items[0]
+        left_kind = left_item.data(0, LEFT_KIND_ROLE)
+        if left_kind not in {"mods_root", "pack"}:
+            return
+
+        mod_paths = self._selected_mod_paths()
+        if not mod_paths:
+            return
+
+        menu = QMenu(self)
+        move_to_pack_action = menu.addAction("Move to pack...")
+        move_to_root_action = menu.addAction("Move to Mods root")
+        move_to_root_action.setEnabled(left_kind == "pack")
+
+        chosen = menu.exec(self.mods_table.viewport().mapToGlobal(pos))
+        if chosen == move_to_pack_action:
+            source_pack = left_item.data(0, LEFT_NAME_ROLE) if left_kind == "pack" else None
+            self._move_selected_mod_to_pack(mod_paths, source_pack)
+        elif chosen == move_to_root_action:
+            self._move_mods_to_root(mod_paths)
+
+    def _move_selected_mod_to_pack(self, mod_paths: list[Path], source_pack: str | None = None) -> None:
+        if self.index is None:
+            return
+        items = sorted([p for p in self.index.packs if p != source_pack], key=str.lower)
+        if not items:
+            self._set_status_line3("No pack available. Create one first.")
+            return
+
+        selected_pack, ok = QInputDialog.getItem(self, "Move Mod to Pack", "Destination pack:", items, 0, False)
+        if not ok or not selected_pack:
+            return
+        self._move_mods_to_pack(mod_paths, selected_pack)
+
+    def _move_mods_to_pack(self, mod_paths: list[Path], target_pack: str) -> None:
+        ok_count = 0
+        fail_messages: list[str] = []
+        for mod_path in mod_paths:
+            done, msg = move_mod_to_pack(mod_path, target_pack, self.library_root)
+            if done:
+                ok_count += 1
+            else:
+                fail_messages.append(msg)
+        if ok_count > 0:
+            self.full_refresh()
+        if fail_messages:
+            self._set_status_line3(f"Transférés: {ok_count}/{len(mod_paths)} | Erreurs: {len(fail_messages)} | {fail_messages[0]}")
+        else:
+            self._set_status_line3(f"Transférés: {ok_count}/{len(mod_paths)} vers '{target_pack}'.")
+
+    def _move_mods_to_root(self, mod_paths: list[Path]) -> None:
+        ok_count = 0
+        fail_messages: list[str] = []
+        for mod_path in mod_paths:
+            done, msg = move_mod_to_mods_root(mod_path, self.beam_mods_root)
+            if done:
+                ok_count += 1
+            else:
+                fail_messages.append(msg)
+        if ok_count > 0:
+            self.full_refresh()
+        if fail_messages:
+            self._set_status_line3(f"Transférés: {ok_count}/{len(mod_paths)} | Erreurs: {len(fail_messages)} | {fail_messages[0]}")
+        else:
+            self._set_status_line3(f"Transférés: {ok_count}/{len(mod_paths)} vers Mods root.")
+
+    def _handle_mod_drop(self, target_kind: str, target_name: str, mod_paths: list[Path]) -> None:
+        if target_kind == "mods_root":
+            self._move_mods_to_root(mod_paths)
+            return
+
+        if target_kind != "pack" or not target_name:
+            self._set_status_line3("Drop target must be a pack or Mods root.")
+            return
+        self._move_mods_to_pack(mod_paths, target_name)
