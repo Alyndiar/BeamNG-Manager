@@ -11,8 +11,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
+
+WEBENGINE_HTTP_CACHE_MB_MAX = 2047
 
 
 class SettingsDialog(QDialog):
@@ -23,10 +26,16 @@ class SettingsDialog(QDialog):
 
         self.beam_mods_edit = QLineEdit(self)
         self.library_root_edit = QLineEdit(self)
+        self.online_cache_size_mb_spin = QSpinBox(self)
+        self.online_cache_size_mb_spin.setRange(64, WEBENGINE_HTTP_CACHE_MB_MAX)
+        self.online_cache_ttl_hours_spin = QSpinBox(self)
+        self.online_cache_ttl_hours_spin.setRange(1, 168)
 
         form = QFormLayout()
         form.addRow("BeamNG Mod Folder", self._path_row(self.beam_mods_edit, self._browse_beam_mods))
         form.addRow("Library Root Folder", self._path_row(self.library_root_edit, self._browse_library_root))
+        form.addRow("Online Cache Size (MB)", self.online_cache_size_mb_spin)
+        form.addRow("Online Cache TTL (hours)", self.online_cache_ttl_hours_spin)
 
         save_btn = QPushButton("Save", self)
         cancel_btn = QPushButton("Cancel", self)
@@ -65,6 +74,9 @@ class SettingsDialog(QDialog):
     def _load(self) -> None:
         self.beam_mods_edit.setText(self.settings.value("beam_mods_root", "", str))
         self.library_root_edit.setText(self.settings.value("library_root", "", str))
+        cache_mb = max(64, min(WEBENGINE_HTTP_CACHE_MB_MAX, int(self.settings.value("online_cache_max_mb", 512, int))))
+        self.online_cache_size_mb_spin.setValue(cache_mb)
+        self.online_cache_ttl_hours_spin.setValue(max(1, int(self.settings.value("online_cache_ttl_hours", 12, int))))
 
     def _save(self) -> None:
         beam_mods = Path(self.beam_mods_edit.text().strip())
@@ -79,6 +91,8 @@ class SettingsDialog(QDialog):
 
         self.settings.setValue("beam_mods_root", str(beam_mods))
         self.settings.setValue("library_root", str(library))
+        self.settings.setValue("online_cache_max_mb", int(self.online_cache_size_mb_spin.value()))
+        self.settings.setValue("online_cache_ttl_hours", int(self.online_cache_ttl_hours_spin.value()))
         self.accept()
 
 
@@ -98,6 +112,13 @@ def load_view_preferences() -> tuple[str, int]:
     if view_mode not in {"text", "icons"}:
         view_mode = "text"
     return view_mode, cols
+
+
+def load_online_cache_preferences() -> tuple[int, int]:
+    settings = QSettings("BeamNGManager", "ModPackManager")
+    cache_mb = max(64, min(WEBENGINE_HTTP_CACHE_MB_MAX, int(settings.value("online_cache_max_mb", 512, int))))
+    ttl_hours = max(1, int(settings.value("online_cache_ttl_hours", 12, int)))
+    return cache_mb, ttl_hours
 
 
 def save_view_preferences(view_mode: str, icon_columns: int) -> None:
