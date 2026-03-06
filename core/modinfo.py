@@ -4,6 +4,7 @@ import json
 import re
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from core.cache import ModInfoCache, _MISS
 from core.utils import safe_rel_depth
@@ -199,6 +200,22 @@ def parse_mod_info(zip_path: Path) -> dict[str, str] | None:
         if value:
             result[out_key] = value
     return result
+
+
+def parse_mod_info_raw(zip_path: Path) -> dict[str, Any] | None:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            selected = select_info_json_path(zf.namelist())
+            if not selected:
+                return None
+            raw = zf.read(selected)
+    except (OSError, zipfile.BadZipFile, KeyError):
+        return None
+
+    parsed = _parse_json_tolerant(raw)
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 def has_info_json(zip_path: Path) -> bool:

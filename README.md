@@ -10,6 +10,10 @@ It lets you:
 - Drag and drop selected mods onto destination packs/mods root.
 - Create, rename, and delete empty packs.
 - Detect duplicate mods across packs.
+- Browse BeamNG repository and forums in an `Online` tab.
+- Intercept BeamNG resource links:
+  - `Subscribe` installs to `mods/repo` (fixed destination).
+  - Direct `Download` prompts destination (`Repo`, `Mods root`, or pack).
 
 ## Requirements
 
@@ -39,6 +43,8 @@ Open `File -> Settings...` and configure:
   - Example: `E:\Mount\NekoNeko101\BeamNG.User\current\mods`
 - **Library Root Folder** (`LibraryRoot`)
   - Contains one-level-deep pack folders
+- **Online Cache Size (MB)**
+- **Online Cache TTL (hours)**
 
 Settings are persisted with `QSettings`:
 - Organization: `BeamNGManager`
@@ -70,6 +76,11 @@ Special directories excluded from orphan/unknown listing:
 - `modconflictresolutions` (case-insensitive)
 
 ## UI Overview
+
+### Main tabs
+
+- `Local`: local pack/mod management.
+- `Online`: embedded repository/forums browsing with top action buttons (`Repo`, `Forums`, `Back`, `Forward`, `Refresh`, `Check Updates`, `Update All`, `Subscriptions`).
 
 ### Left panel order
 
