@@ -149,10 +149,12 @@ def rename_pack(old_name: str, new_name: str, beam_mods_root: str | Path, librar
     if new_link.exists():
         return False, f"Target link path already exists in mods root: {new_link}"
 
+    old_link_exists = old_link.exists()
+    old_link_is_junction = junctions.is_junction(old_link)
     was_active = False
-    if old_link.exists():
-        if not junctions.is_junction(old_link):
-            return False, f"Cannot rename: {old_link} exists and is not a junction."
+    if old_link_exists and not old_link_is_junction:
+        return False, f"Cannot rename: {old_link} exists and is not a junction."
+    if old_link_is_junction:
         target = junctions.get_junction_target(old_link)
         if target is None or norm_path(str(target)) != norm_path(str(old_pack)):
             return False, f"Cannot rename: junction does not point to pack path: {old_link}"

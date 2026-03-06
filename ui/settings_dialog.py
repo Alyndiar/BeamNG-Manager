@@ -88,3 +88,21 @@ def load_settings() -> tuple[str, str]:
         settings.value("beam_mods_root", "", str),
         settings.value("library_root", "", str),
     )
+
+
+def load_view_preferences() -> tuple[str, int]:
+    settings = QSettings("BeamNGManager", "ModPackManager")
+    view_mode = settings.value("mods_view_mode", "text", str)
+    raw_cols = settings.value("mods_icon_columns", 4, int)
+    cols = max(2, min(8, int(raw_cols)))
+    if view_mode not in {"text", "icons"}:
+        view_mode = "text"
+    return view_mode, cols
+
+
+def save_view_preferences(view_mode: str, icon_columns: int) -> None:
+    settings = QSettings("BeamNGManager", "ModPackManager")
+    mode = "icons" if view_mode == "icons" else "text"
+    cols = max(2, min(8, int(icon_columns)))
+    settings.setValue("mods_view_mode", mode)
+    settings.setValue("mods_icon_columns", cols)
