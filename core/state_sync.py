@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core.cache import ModEntry, ScanIndex
 from core.modinfo import parse_mod_info_raw
@@ -227,67 +227,50 @@ def sync_db_from_index(
     db_path: Path,
     active_by_db_fullpath: dict[str, bool],
     repo_mod_id_map: dict[str, str] | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
+    del repo_mod_id_map
     payload = load_beam_db(db_path)
     existing_mods = payload.get("mods", {})
     if not isinstance(existing_mods, dict):
         existing_mods = {}
+    managed_fullpaths: set[str] = set()
+    for mod in index.loose_mods:
+        managed_fullpaths.add(mod_db_fullpath(index, mod))
+    for mod in index.repo_mods:
+        managed_fullpaths.add(mod_db_fullpath(index, mod))
+    for mod_list in index.pack_mods.values():
+        for mod in mod_list:
+            managed_fullpaths.add(mod_db_fullpath(index, mod))
 
-    existing_by_fullpath: dict[str, tuple[str, dict[str, Any]]] = {}
-    for mod_key, value in existing_mods.items():
+    managed_rows: list[dict[str, Any]] = []
+    for value in existing_mods.values():
         if not isinstance(value, dict):
             continue
-        fp = str(value.get("fullpath") or "").strip()
-        if not fp:
+        fullpath = str(value.get("fullpath") or "").strip()
+        if not fullpath or fullpath not in managed_fullpaths:
             continue
-        existing_by_fullpath[fp] = (str(mod_key), value)
+        managed_rows.append(value)
 
-    active_packs = set(index.active_packs.keys())
-    included: list[ModEntry] = []
-    included.extend(index.loose_mods)
-    included.extend(index.repo_mods)
-    for pack_name in index.packs:
-        if pack_name not in active_packs:
+    total_rows = len(managed_rows)
+    if progress_cb is not None:
+        progress_cb(0, total_rows)
+
+    changed = False
+    for index_row, value in enumerate(managed_rows, start=1):
+        fullpath = str(value.get("fullpath") or "").strip()
+        current_active = bool(value.get("active", False))
+        next_active = bool(active_by_db_fullpath.get(fullpath, current_active))
+        if next_active == current_active:
+            if progress_cb is not None and (index_row == total_rows or index_row % 100 == 0):
+                progress_cb(index_row, total_rows)
             continue
-        included.extend(index.pack_mods.get(pack_name, []))
-    included_fullpaths = {mod_db_fullpath(index, mod) for mod in included}
+        value["active"] = next_active
+        changed = True
+        if progress_cb is not None and (index_row == total_rows or index_row % 100 == 0):
+            progress_cb(index_row, total_rows)
 
-    keep_mods: dict[str, dict[str, Any]] = {}
-
-    # Keep unmanaged entries but remove entries that belong to disabled packs.
-    for mod_key, value in existing_mods.items():
-        if not isinstance(value, dict):
-            continue
-        dirname = str(value.get("dirname") or "")
-        fullpath = str(value.get("fullpath") or "")
-        removed_for_disabled_pack = False
-        for pack_name in index.packs:
-            if pack_name in active_packs:
-                continue
-            prefix = f"/mods/{pack_name}/"
-            if dirname.startswith(prefix) or fullpath.startswith(prefix):
-                removed_for_disabled_pack = True
-                break
-        if fullpath in included_fullpaths:
-            # Rebuild managed entries keyed by their modname.
-            continue
-        if not removed_for_disabled_pack:
-            keep_mods[str(mod_key)] = value
-
-    # Add/update entries for included mods.
-    for mod in included:
-        fp = mod_db_fullpath(index, mod)
-        existing_pair = existing_by_fullpath.get(fp)
-        existing_value = existing_pair[1] if existing_pair else None
-        active = bool(active_by_db_fullpath.get(fp, existing_value.get("active", True) if existing_value else True))
-        built = build_db_entry(mod, fp, active, existing=existing_value, repo_mod_id_map=repo_mod_id_map)
-        preferred_key = str(built.get("modname") or db_modname_from_filename(mod.path.name))
-        target_key = _pick_mod_key(keep_mods, preferred_key, fp)
-        # Keep BeamNG key and entry.modname aligned.
-        built["modname"] = target_key
-        keep_mods[target_key] = built
-
-    payload["mods"] = keep_mods
-    payload["header"] = {"version": 1.1}
-    save_beam_db(db_path, payload)
+    payload["mods"] = existing_mods
+    if changed:
+        save_beam_db(db_path, payload)
     return payload

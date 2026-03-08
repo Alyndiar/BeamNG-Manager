@@ -78,15 +78,24 @@ class SettingsDialog(QDialog):
         self.online_cache_size_mb_spin.setValue(cache_mb)
         self.online_cache_ttl_hours_spin.setValue(max(1, int(self.settings.value("online_cache_ttl_hours", 12, int))))
 
+    def _show_silent_warning(self, title: str, text: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.NoIcon)
+        box.setWindowTitle(str(title))
+        box.setText(str(text))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Ok)
+        box.exec()
+
     def _save(self) -> None:
         beam_mods = Path(self.beam_mods_edit.text().strip())
         library = Path(self.library_root_edit.text().strip())
 
         if not beam_mods.exists() or not beam_mods.is_dir():
-            QMessageBox.warning(self, "Invalid Folder", "BeamNG Mod Folder must be an existing directory.")
+            self._show_silent_warning("Invalid Folder", "BeamNG Mod Folder must be an existing directory.")
             return
         if not library.exists() or not library.is_dir():
-            QMessageBox.warning(self, "Invalid Folder", "Library Root Folder must be an existing directory.")
+            self._show_silent_warning("Invalid Folder", "Library Root Folder must be an existing directory.")
             return
 
         self.settings.setValue("beam_mods_root", str(beam_mods))

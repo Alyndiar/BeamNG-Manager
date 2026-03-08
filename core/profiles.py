@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def profiles_dir(project_root: Path) -> Path:
@@ -33,13 +33,53 @@ def load_profile(path: Path) -> dict[str, Any] | None:
     return parsed
 
 
-def save_profile(path: Path, snapshot: dict[str, Any], profile_name: str | None = None) -> None:
+def save_profile(
+    path: Path,
+    snapshot: dict[str, Any],
+    profile_name: str | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    packs_raw = snapshot.get("packs", {})
+    mods_raw = snapshot.get("mods", {})
+    if not isinstance(packs_raw, dict):
+        packs_raw = {}
+    if not isinstance(mods_raw, dict):
+        mods_raw = {}
+
+    total = len(packs_raw) + len(mods_raw)
+    current = 0
+    if progress_cb is not None:
+        progress_cb(0, total, "Preparing profile entries")
+
+    packs: dict[str, bool] = {}
+    for key in sorted(packs_raw.keys(), key=lambda v: str(v).lower()):
+        packs[str(key)] = bool(packs_raw[key])
+        current += 1
+        if progress_cb is not None and (current == total or current % 200 == 0):
+            progress_cb(current, total, "Preparing profile entries")
+
+    mods: dict[str, bool] = {}
+    for key in sorted(mods_raw.keys(), key=lambda v: str(v).lower()):
+        key_text = str(key).strip()
+        if not key_text:
+            current += 1
+            if progress_cb is not None and (current == total or current % 200 == 0):
+                progress_cb(current, total, "Preparing profile entries")
+            continue
+        mods[key_text] = bool(mods_raw[key])
+        current += 1
+        if progress_cb is not None and (current == total or current % 200 == 0):
+            progress_cb(current, total, "Preparing profile entries")
+
+    if progress_cb is not None:
+        progress_cb(total, total, "Writing profile file")
+
     payload = {
         "name": profile_name or path.stem,
         "saved_at": int(time.time()),
-        "packs": snapshot.get("packs", {}),
-        "mods": snapshot.get("mods", {}),
+        "packs": packs,
+        "mods": mods,
     }
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
