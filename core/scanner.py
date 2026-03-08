@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
 from core import junctions
 from core.cache import ModEntry, ScanIndex, ScanTotals, UnknownJunction
 from core.utils import norm_path
 
 _SPECIAL_MODS_DIRS = {"repo", "multiplayer", "mod_manifests", "modconflictresolutions"}
+
+
+ProgressCallback = Callable[[dict[str, object]], None]
 
 
 def _scan_zips_recursive(root: Path, source: str, pack_name: str | None = None) -> list[ModEntry]:
@@ -67,18 +71,36 @@ def _pack_dirs(library_root: Path) -> list[Path]:
     return sorted([p for p in library_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
 
 
-def build_full_index(beam_mods_root: str | Path, library_root: str | Path) -> ScanIndex:
+def build_full_index(
+    beam_mods_root: str | Path,
+    library_root: str | Path,
+    progress_cb: ProgressCallback | None = None,
+) -> ScanIndex:
     beam_mods = Path(beam_mods_root)
     library = Path(library_root)
     repo = beam_mods / "repo"
 
+    def emit(message: str, current: int | None = None, total: int | None = None) -> None:
+        if progress_cb is None:
+            return
+        payload: dict[str, object] = {"message": message}
+        if current is not None:
+            payload["current"] = int(current)
+        if total is not None:
+            payload["total"] = int(total)
+        progress_cb(payload)
+
     index = ScanIndex(beam_mods_root=beam_mods, beam_repo_root=repo, library_root=library)
 
+    emit("Scanning library packs...")
     pack_dirs = _pack_dirs(library)
     index.packs = [p.name for p in pack_dirs]
-    for pack in pack_dirs:
+    total_packs = len(pack_dirs)
+    for pack_index, pack in enumerate(pack_dirs, start=1):
         index.pack_mods[pack.name] = _scan_zips_recursive(pack, source="pack", pack_name=pack.name)
+        emit(f"Scanning library packs ({pack.name})", current=pack_index, total=total_packs)
 
+    emit("Scanning junctions...")
     junction_map = junctions.list_junctions(beam_mods)
     library_norm = {name: norm_path(str(library / name)) for name in index.packs}
 
@@ -89,7 +111,13 @@ def build_full_index(beam_mods_root: str | Path, library_root: str | Path) -> Sc
         if norm_path(str(target)) == library_norm[pack_name]:
             index.active_packs[pack_name] = target
 
-    for name, target in sorted(junction_map.items(), key=lambda i: i[0].lower()):
+    unknown_items = [
+        (name, target)
+        for name, target in sorted(junction_map.items(), key=lambda i: i[0].lower())
+        if name.lower() not in _SPECIAL_MODS_DIRS and name not in index.packs
+    ]
+    unknown_total = len(unknown_items)
+    for unknown_index, (name, target) in enumerate(unknown_items, start=1):
         if name.lower() in _SPECIAL_MODS_DIRS:
             continue
         if name in index.packs:
@@ -101,17 +129,30 @@ def build_full_index(beam_mods_root: str | Path, library_root: str | Path) -> Sc
             target=target,
             mods=mods,
         )
+        emit(f"Scanning unknown links ({name})", current=unknown_index, total=unknown_total)
 
-    for child in sorted(beam_mods.iterdir(), key=lambda p: p.name.lower()):
+    emit("Scanning orphan folders...")
+    orphan_children = [
+        child
+        for child in sorted(beam_mods.iterdir(), key=lambda p: p.name.lower())
+        if child.is_dir() and child.name.lower() not in _SPECIAL_MODS_DIRS and not junctions.is_junction(child)
+    ]
+    orphan_total = len(orphan_children)
+    for orphan_index, child in enumerate(orphan_children, start=1):
         if not child.is_dir() or child.name.lower() in _SPECIAL_MODS_DIRS:
             continue
         if junctions.is_junction(child):
             continue
         index.orphan_folders[child.name] = _scan_zips_recursive(child, source="orphan")
+        emit(f"Scanning orphan folders ({child.name})", current=orphan_index, total=orphan_total)
 
+    emit("Scanning loose mods...")
     index.loose_mods = _scan_zips_non_recursive(beam_mods, source="loose")
+    emit("Scanning repo mods...")
     index.repo_mods = _scan_zips_recursive(repo, source="repo")
+    emit("Finalizing scan results...")
     index.totals = _build_totals(index)
+    emit("Scan complete.")
     return index
 
 
