@@ -228,3 +228,18 @@ def move_mod_to_mods_root(mod_zip_path: str | Path, beam_mods_root: str | Path) 
     except OSError as exc:
         return False, f"Move failed: {exc}"
     return True, f"Moved mod to Mods root: {src.name}"
+
+
+def delete_mod_file(mod_zip_path: str | Path) -> tuple[bool, str]:
+    src = Path(mod_zip_path)
+    if not src.exists():
+        return False, f"Mod not found: {src}"
+    if not src.is_file():
+        return False, f"Not a file: {src}"
+    if src.suffix.lower() != ".zip":
+        return False, "Only .zip mod files can be deleted."
+    try:
+        src.unlink()
+    except OSError as exc:
+        return False, f"Delete failed: {exc}"
+    return True, f"Deleted mod: {src.name}"

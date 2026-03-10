@@ -4,6 +4,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -15,7 +17,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-WEBENGINE_HTTP_CACHE_MB_MAX = 2047
+FIREFOX_BRIDGE_PORT_DEFAULT = 49441
+OPEN_IN_BROWSER_MODE_DEFAULT = "bridge"
+OPEN_IN_BROWSER_MODE_OPTIONS = ("default", "bridge")
+BRIDGE_DEBUG_DEFAULT = False
 
 
 class SettingsDialog(QDialog):
@@ -26,16 +31,19 @@ class SettingsDialog(QDialog):
 
         self.beam_mods_edit = QLineEdit(self)
         self.library_root_edit = QLineEdit(self)
-        self.online_cache_size_mb_spin = QSpinBox(self)
-        self.online_cache_size_mb_spin.setRange(64, WEBENGINE_HTTP_CACHE_MB_MAX)
-        self.online_cache_ttl_hours_spin = QSpinBox(self)
-        self.online_cache_ttl_hours_spin.setRange(1, 168)
+        self.firefox_bridge_port_spin = QSpinBox(self)
+        self.firefox_bridge_port_spin.setRange(1024, 65535)
+        self.open_in_browser_mode_combo = QComboBox(self)
+        self.open_in_browser_mode_combo.addItem("Default browser", "default")
+        self.open_in_browser_mode_combo.addItem("Bridge", "bridge")
+        self.bridge_debug_checkbox = QCheckBox("Enable bridge debug logs in console", self)
 
         form = QFormLayout()
         form.addRow("BeamNG Mod Folder", self._path_row(self.beam_mods_edit, self._browse_beam_mods))
         form.addRow("Library Root Folder", self._path_row(self.library_root_edit, self._browse_library_root))
-        form.addRow("Online Cache Size (MB)", self.online_cache_size_mb_spin)
-        form.addRow("Online Cache TTL (hours)", self.online_cache_ttl_hours_spin)
+        form.addRow("Open Repo URL via", self.open_in_browser_mode_combo)
+        form.addRow("Browser Bridge Port", self.firefox_bridge_port_spin)
+        form.addRow("Bridge Debug", self.bridge_debug_checkbox)
 
         save_btn = QPushButton("Save", self)
         cancel_btn = QPushButton("Cancel", self)
@@ -74,9 +82,13 @@ class SettingsDialog(QDialog):
     def _load(self) -> None:
         self.beam_mods_edit.setText(self.settings.value("beam_mods_root", "", str))
         self.library_root_edit.setText(self.settings.value("library_root", "", str))
-        cache_mb = max(64, min(WEBENGINE_HTTP_CACHE_MB_MAX, int(self.settings.value("online_cache_max_mb", 512, int))))
-        self.online_cache_size_mb_spin.setValue(cache_mb)
-        self.online_cache_ttl_hours_spin.setValue(max(1, int(self.settings.value("online_cache_ttl_hours", 12, int))))
+        open_mode = load_browser_open_mode()
+        index = 0 if open_mode == "default" else 1
+        self.open_in_browser_mode_combo.setCurrentIndex(index)
+        bridge_port = int(self.settings.value("firefox_bridge_port", FIREFOX_BRIDGE_PORT_DEFAULT, int))
+        self.firefox_bridge_port_spin.setValue(max(1024, min(65535, bridge_port)))
+        bridge_debug = bool(self.settings.value("bridge_debug_enabled", BRIDGE_DEBUG_DEFAULT, bool))
+        self.bridge_debug_checkbox.setChecked(bridge_debug)
 
     def _show_silent_warning(self, title: str, text: str) -> None:
         box = QMessageBox(self)
@@ -100,8 +112,9 @@ class SettingsDialog(QDialog):
 
         self.settings.setValue("beam_mods_root", str(beam_mods))
         self.settings.setValue("library_root", str(library))
-        self.settings.setValue("online_cache_max_mb", int(self.online_cache_size_mb_spin.value()))
-        self.settings.setValue("online_cache_ttl_hours", int(self.online_cache_ttl_hours_spin.value()))
+        self.settings.setValue("open_in_browser_mode", str(self.open_in_browser_mode_combo.currentData()))
+        self.settings.setValue("firefox_bridge_port", int(self.firefox_bridge_port_spin.value()))
+        self.settings.setValue("bridge_debug_enabled", bool(self.bridge_debug_checkbox.isChecked()))
         self.accept()
 
 
@@ -123,11 +136,23 @@ def load_view_preferences() -> tuple[str, int]:
     return view_mode, cols
 
 
-def load_online_cache_preferences() -> tuple[int, int]:
+def load_firefox_bridge_port() -> int:
     settings = QSettings("BeamNGManager", "ModPackManager")
-    cache_mb = max(64, min(WEBENGINE_HTTP_CACHE_MB_MAX, int(settings.value("online_cache_max_mb", 512, int))))
-    ttl_hours = max(1, int(settings.value("online_cache_ttl_hours", 12, int)))
-    return cache_mb, ttl_hours
+    value = int(settings.value("firefox_bridge_port", FIREFOX_BRIDGE_PORT_DEFAULT, int))
+    return max(1024, min(65535, value))
+
+
+def load_browser_open_mode() -> str:
+    settings = QSettings("BeamNGManager", "ModPackManager")
+    value = str(settings.value("open_in_browser_mode", OPEN_IN_BROWSER_MODE_DEFAULT, str) or OPEN_IN_BROWSER_MODE_DEFAULT)
+    if value not in OPEN_IN_BROWSER_MODE_OPTIONS:
+        return OPEN_IN_BROWSER_MODE_DEFAULT
+    return value
+
+
+def load_bridge_debug_enabled() -> bool:
+    settings = QSettings("BeamNGManager", "ModPackManager")
+    return bool(settings.value("bridge_debug_enabled", BRIDGE_DEBUG_DEFAULT, bool))
 
 
 def save_view_preferences(view_mode: str, icon_columns: int) -> None:

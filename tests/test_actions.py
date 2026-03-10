@@ -55,6 +55,22 @@ def test_move_mod_to_pack_and_back_to_root(tmp_path: Path) -> None:
     assert (beam / "mycar.zip").exists()
 
 
+def test_delete_mod_file(tmp_path: Path) -> None:
+    mod = tmp_path / "delete_me.zip"
+    mod.write_bytes(b"zip")
+    ok, _ = actions.delete_mod_file(mod)
+    assert ok
+    assert not mod.exists()
+
+
+def test_delete_mod_file_rejects_non_zip(tmp_path: Path) -> None:
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("x", encoding="utf-8")
+    ok, _ = actions.delete_mod_file(file_path)
+    assert not ok
+    assert file_path.exists()
+
+
 def test_rename_pack_active_migrates_junction(tmp_path: Path, monkeypatch) -> None:
     beam = tmp_path / "beam"
     lib = tmp_path / "lib"

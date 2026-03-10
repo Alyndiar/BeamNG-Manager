@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "BeamNG-Manager Bridge (Chrome)",
+  "version": "0.1.7",
+  "description": "Shows BeamNG-Manager installed/subscribed badges on BeamNG resources/forums and handles open-url bridge requests.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://www.beamng.com/resources/*",
+    "https://www.beamng.com/forums/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "BeamNG-Manager Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.beamng.com/resources/*",
+        "https://www.beamng.com/forums/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}
