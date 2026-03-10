@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import itertools
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -12,12 +12,13 @@ from pathlib import Path
 from PySide6.QtCore import (
     QByteArray,
     QBuffer,
-    QDateTime,
     QEvent,
     QEventLoop,
     QIODevice,
     QMimeData,
     QObject,
+    QPoint,
+    QRect,
     QRunnable,
     QSize,
     Qt,
@@ -40,9 +41,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -53,7 +54,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSplitter,
     QStyle,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (
 from core.actions import (
     beamng_is_running,
     create_pack,
+    delete_mod_file,
     delete_empty_pack,
     disable_pack,
     enable_pack,
@@ -74,7 +75,7 @@ from core.actions import (
     rename_pack,
 )
 from core.cache import ModEntry, ModInfoCache, ScanIndex
-from core.online_repo import OnlineRepoClient, is_beamng_resource_download_url, parse_beamng_protocol_uri
+from core.firefox_bridge import FirefoxBridgeServer
 from core import profiles as profile_store
 from core.state_sync import (
     collect_profile_snapshot,
@@ -84,29 +85,21 @@ from core.state_sync import (
     sync_db_from_index,
 )
 from core.modpreview import read_preview_image
-from core.modinfo import get_mod_info_cached, has_info_json, parse_mod_info
+from core.modinfo import get_info_json_analysis_cached, get_mod_info_cached, set_default_mod_info_cache
 from core import scanner
 from core.utils import human_size
 from ui.duplicates_dialog import DuplicatesDialog
+from ui.info_json_viewer_dialog import InfoJsonViewerDialog
 from ui.settings_dialog import (
     SettingsDialog,
-    load_online_cache_preferences,
+    load_browser_open_mode,
+    load_bridge_debug_enabled,
+    load_firefox_bridge_port,
     load_settings,
     load_view_preferences,
     save_view_preferences,
 )
 from ui.beamng_status_poller import BeamNGStatusPoller
-
-try:
-    from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-
-    WEBENGINE_AVAILABLE = True
-except Exception:  # pragma: no cover - environment dependent
-    QWebEnginePage = object  # type: ignore[assignment]
-    QWebEngineProfile = object  # type: ignore[assignment]
-    QWebEngineView = object  # type: ignore[assignment]
-    WEBENGINE_AVAILABLE = False
 
 
 LEFT_KIND_ROLE = Qt.UserRole
@@ -117,9 +110,6 @@ LEFT_ACTIVE_ROLE = Qt.UserRole + 3
 RIGHT_PATH_ROLE = Qt.UserRole
 MOD_PATHS_MIME = "application/x-beamng-mod-paths"
 _MISS = object()
-_WEBENGINE_HTTP_CACHE_MAX_BYTES = 2_147_483_647
-_WEBENGINE_HTTP_CACHE_MAX_MB = _WEBENGINE_HTTP_CACHE_MAX_BYTES // (1024 * 1024)
-_ONLINE_REQUEST_PROMPT_TIMEOUT_SECONDS = 30
 _BEAMNG_POLL_INTERVAL_SECONDS = 15.0
 _BEAMNG_POLLER_STOP_TIMEOUT_MS = 1500
 _TABLE_POPULATE_BATCH_SIZE = 120
@@ -130,11 +120,6 @@ _ICON_ACTIVE_INDICATOR_SIZE = 22
 _DB_WRITE_DEBOUNCE_MS = 900
 _DB_WRITE_FLUSH_WAIT_SECONDS = 6.0
 _PROFILE_SAVE_TIMEOUT_SECONDS = 45.0
-
-
-def _webengine_cache_bytes(cache_mb: int) -> int:
-    mb = max(64, min(_WEBENGINE_HTTP_CACHE_MAX_MB, int(cache_mb)))
-    return mb * 1024 * 1024
 
 _VEHICLES_LINE2 = ["Name", "Brand", "Author", "Country", "Body Style", "Type", "Years", "Derby Class"]
 _VEHICLES_LINE3 = ["Description", "Slogan"]
@@ -161,6 +146,30 @@ _OTHER_LINE2 = [
     "username",
 ]
 _OTHER_LINE3 = ["Description", "Slogan", "features", "tagline"]
+
+_REPO_CATEGORY_LABEL_BY_ID = {
+    2: "Vehicles",
+    3: "Land",
+    4: "Air",
+    5: "Props",
+    6: "Boats",
+    7: "Mods of Mods",
+    8: "Scenarios",
+    9: "Terrains/Levels/Maps",
+    10: "UI Apps",
+    12: "Skins",
+    13: "Sounds",
+    14: "Configurations",
+    15: "License Plates",
+    16: "Automation",
+    17: "Track Builder",
+}
+
+_REPO_CATEGORY_LABEL_BY_INFO_PATH = {
+    "vehicles": "Vehicles",
+    "levels": "Terrains/Levels/Maps",
+    "mod_info": "Mods of Mods",
+}
 
 
 class ModsTableWidget(QTableWidget):
@@ -396,23 +405,93 @@ class FnWorker(QRunnable):
         self.signals.done.emit(value)
 
 
-if WEBENGINE_AVAILABLE:
+class FlowLayout(QLayout):
+    def __init__(self, parent: QWidget | None = None, margin: int = 0, h_spacing: int = 6, v_spacing: int = 4) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self._h_spacing = max(0, int(h_spacing))
+        self._v_spacing = max(0, int(v_spacing))
+        self.setContentsMargins(margin, margin, margin, margin)
 
-    class OnlineWebPage(QWebEnginePage):
-        def __init__(self, profile, navigate_handler, parent=None) -> None:
-            super().__init__(profile, parent)
-            self._navigate_handler = navigate_handler
+    def __del__(self) -> None:
+        item = self.takeAt(0)
+        while item is not None:
+            item = self.takeAt(0)
 
-        def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame: bool) -> bool:
-            if self._navigate_handler is not None and self._navigate_handler(url, nav_type, is_main_frame):
-                return False
-            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def addWidget(self, widget: QWidget) -> None:
+        super().addWidget(widget)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, max(0, int(width)), 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        margins = self.contentsMargins()
+        width = 0
+        height = 0
+        for item in self._items:
+            hint = item.minimumSize()
+            width = max(width, hint.width())
+            height = max(height, hint.height())
+        return QSize(width + margins.left() + margins.right(), height + margins.top() + margins.bottom())
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = area.x()
+        y = area.y()
+        line_height = 0
+        max_right = area.right()
+
+        for item in self._items:
+            widget = item.widget()
+            if widget is not None and not widget.isVisible():
+                continue
+            hint = item.sizeHint()
+            next_x = x + hint.width()
+            if line_height > 0 and next_x > max_right and area.width() > 0:
+                x = area.x()
+                y += line_height + self._v_spacing
+                next_x = x + hint.width()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x + self._h_spacing
+            line_height = max(line_height, hint.height())
+
+        used_height = (y - area.y()) + line_height
+        return used_height + margins.top() + margins.bottom()
 
 
 class MainWindow(QMainWindow):
-    onlineConsoleLog = Signal(str)
-    onlineRequestErrorPrompt = Signal(int, str)
-
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("BeamNG Mod Pack Manager")
@@ -420,6 +499,7 @@ class MainWindow(QMainWindow):
 
         self.thread_pool = QThreadPool.globalInstance()
         self.mod_info_cache = ModInfoCache()
+        set_default_mod_info_cache(self.mod_info_cache)
 
         self.beam_mods_root = ""
         self.library_root = ""
@@ -433,39 +513,37 @@ class MainWindow(QMainWindow):
         self._all_mod_by_path: dict[str, ModEntry] = {}
         self.preview_cache_dir = Path()
         self.preview_cache_index_file = Path()
+        self.mod_info_cache_file = Path()
         self._loading_view_preferences = False
         self._updating_icon_grid_metrics = False
         self.status_line3_message = ""
         self._local_status_lines: tuple[str, str, str] = ("", "", "")
         self._workers: set[FnWorker] = set()
-        self._online_error_prompt_lock = threading.Lock()
-        self._online_error_prompt_waiters: dict[int, tuple[threading.Event, dict[str, bool]]] = {}
-        self._online_error_prompt_seq = itertools.count(1)
-        self.online_client: OnlineRepoClient | None = None
-        self.online_profile = None
-        self.online_view = None
-        self.online_page = None
-        self.online_available = WEBENGINE_AVAILABLE
-        self.online_current_url = ""
-        self.online_hover_url = ""
-        self.online_status_line2 = ""
+        self._info_json_viewers: list[InfoJsonViewerDialog] = []
+        self.firefox_bridge_server: FirefoxBridgeServer | None = None
+        self._bridge_last_consumed_command_id = 0
         self.settings_store = QSettings("BeamNGManager", "ModPackManager")
-        self.online_dark_mode_enabled = bool(self.settings_store.value("online_dark_mode", True, bool))
-        self.online_debug_enabled = bool(self.settings_store.value("online_debug_enabled", False, bool))
         self.confirm_actions_enabled = bool(self.settings_store.value("confirm_actions_enabled", True, bool))
         self.info_caption_enabled = bool(self.settings_store.value("info_caption_enabled", False, bool))
+        self.download_watch_enabled = bool(self.settings_store.value("download_watch_enabled", False, bool))
+        self.open_in_browser_mode = load_browser_open_mode()
+        self.bridge_debug_enabled = load_bridge_debug_enabled()
+        self.firefox_bridge_port = int(self.settings_store.value("firefox_bridge_port", 49441, int))
         _startup_last_profile = str(self.settings_store.value("last_profile_path", "", str) or "").strip()
         self._startup_last_profile_to_apply: Path | None = Path(_startup_last_profile) if _startup_last_profile else None
         self._startup_profile_apply_pending = True
-        self.online_cache_max_mb, self.online_cache_ttl_hours = load_online_cache_preferences()
-        self.online_cache_max_mb = max(64, min(_WEBENGINE_HTTP_CACHE_MAX_MB, int(self.online_cache_max_mb)))
         self.project_root = Path(__file__).resolve().parents[1]
         self.db_path = Path()
         self.active_by_db_fullpath: dict[str, bool] = {}
         self._updating_mod_table = False
         self._mod_row_by_path: dict[str, int] = {}
         self._icon_holder_by_path: dict[str, QWidget] = {}
+        self._icon_source_pixmap_by_path: dict[str, QPixmap] = {}
         self._mod_prefix_by_path: dict[str, str] = {}
+        self._mod_info_label_by_path: dict[str, str] = {}
+        self._mod_category_by_path: dict[str, str] = {}
+        self._db_mod_data_by_fullpath: dict[str, dict[str, object]] = {}
+        self.mods_sort_mode = str(self.settings_store.value("mods_sort_mode", "name", str) or "name")
         self._table_population_token = 0
         self._table_info_token = 0
         self._icon_population_token = 0
@@ -484,6 +562,7 @@ class MainWindow(QMainWindow):
         self._interaction_lock_popup_cooldown_until_ms = 0
         self._interaction_lock_popup: QMessageBox | None = None
         self._interaction_lock_widgets: list[QWidget] = []
+        self._profile_load_in_progress = False
         self._db_write_pending = False
         self._db_write_in_flight = False
         self._db_write_show_progress = False
@@ -501,14 +580,17 @@ class MainWindow(QMainWindow):
         self._db_write_timer = QTimer(self)
         self._db_write_timer.setSingleShot(True)
         self._db_write_timer.timeout.connect(self._flush_deferred_db_write)
+        self._bridge_events_timer = QTimer(self)
+        self._bridge_events_timer.setInterval(500)
+        self._bridge_events_timer.timeout.connect(self._poll_bridge_events)
 
         self._init_preview_cache_storage()
-        self._init_online_client()
+        self._init_mod_info_cache_storage()
         self._build_ui()
+        self._start_firefox_bridge_server()
+        self._bridge_events_timer.start()
         self._build_menu()
         self._update_beamng_status_indicator()
-        self.onlineConsoleLog.connect(self._append_online_console_line)
-        self.onlineRequestErrorPrompt.connect(self._on_online_request_error_prompt)
         self._beamng_status_poller.stateChanged.connect(self._on_beamng_runtime_state_changed)
 
         self._load_settings_and_maybe_scan()
@@ -572,31 +654,70 @@ class MainWindow(QMainWindow):
         except (OSError, json.JSONDecodeError):
             self.mod_preview_index = {}
 
-    def _init_online_client(self) -> None:
+    def _init_mod_info_cache_storage(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
-        cache_root = project_root / ".cache" / "online"
-        self.online_client = OnlineRepoClient(
-            beam_mods_root=self.beam_mods_root or ".",
-            library_root=self.library_root or ".",
-            cache_root=cache_root,
-            ttl_hours=self.online_cache_ttl_hours,
-            cache_max_mb=self.online_cache_max_mb,
-        )
-        self.online_client.set_debug_logging(
-            self.online_debug_enabled,
-            self._emit_online_console_log if self.online_debug_enabled else None,
-        )
-        self.online_client.set_request_error_handler(self._decide_online_request_error)
+        cache_dir = project_root / ".cache" / "mod_info_cache"
+        self.mod_info_cache_file = cache_dir / "cache.pkl"
+        self.mod_info_cache.load_from_file(self.mod_info_cache_file)
 
-    def _update_online_client_roots(self) -> None:
-        if self.online_client is None:
+    def _save_mod_info_cache(self) -> None:
+        if not self.mod_info_cache_file:
             return
-        if self.beam_mods_root:
-            self.online_client.beam_mods_root = Path(self.beam_mods_root)
-        if self.library_root:
-            self.online_client.library_root = Path(self.library_root)
-        self.online_client.update_cache_policy(self.online_cache_ttl_hours, self.online_cache_max_mb)
-        self._refresh_online_installed_indicators()
+        self.mod_info_cache.save_to_file(self.mod_info_cache_file)
+
+    def _bridge_debug_log(self, message: str) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        print(text, flush=True)
+
+    def _start_firefox_bridge_server(self) -> None:
+        preferred = max(1024, min(65535, int(self.firefox_bridge_port)))
+        server = FirefoxBridgeServer(
+            self._online_installed_marker_sets,
+            port=preferred,
+            debug_enabled=bool(self.bridge_debug_enabled),
+            debug_logger=self._bridge_debug_log,
+        )
+        ok, message = server.start()
+        if ok:
+            self.firefox_bridge_server = server
+            self._bridge_last_consumed_command_id = 0
+            self.firefox_bridge_port = int(preferred)
+            self._set_status_line3(message)
+            return
+        self._set_status_line3(f"Firefox bridge unavailable on configured port {preferred}: {message}")
+
+    def _stop_firefox_bridge_server(self) -> None:
+        server = self.firefox_bridge_server
+        self.firefox_bridge_server = None
+        self._bridge_last_consumed_command_id = 0
+        if server is None:
+            return
+        server.stop()
+
+    def _restart_firefox_bridge_server(self) -> None:
+        self._stop_firefox_bridge_server()
+        self._start_firefox_bridge_server()
+
+    def _poll_bridge_events(self) -> None:
+        server = self.firefox_bridge_server
+        if server is None:
+            return
+        consumed = server.drain_consumed_commands()
+        if not consumed:
+            return
+        newest = consumed[-1]
+        command_id = int(newest.get("id") or 0)
+        if command_id <= 0:
+            return
+        if command_id <= int(self._bridge_last_consumed_command_id):
+            return
+        self._bridge_last_consumed_command_id = command_id
+        raw_url = str(newest.get("url") or "").strip()
+        if len(raw_url) > 90:
+            raw_url = f"{raw_url[:87]}..."
+        self._set_status_line3(f"Bridge received command id={command_id}: {raw_url}")
 
     def _show_silent_message(
         self,
@@ -672,8 +793,6 @@ class MainWindow(QMainWindow):
                 timer.stop()
             self._db_write_pending = False
             self._db_write_show_progress = False
-            if self.online_client is not None:
-                self.online_client.request_cancel()
             self._set_status_line3("BeamNG started. File-mutating actions are now blocked.")
             return
         self._set_status_line3("BeamNG closed. Reloading state and re-enabling actions...")
@@ -817,6 +936,14 @@ class MainWindow(QMainWindow):
         self.known_mod_paths = paths
         self._all_mod_by_path = all_by_path
 
+    def _sync_mod_info_cache_with_index(self) -> None:
+        signatures: dict[str, tuple[int, int]] = {}
+        for entry in self._all_mod_by_path.values():
+            if entry.mtime_ns is None:
+                continue
+            signatures[str(entry.path)] = (int(entry.mtime_ns), int(entry.size))
+        self.mod_info_cache.update_index_signatures(signatures)
+
     def _clear_preview_cache(self) -> None:
         removed_files = 0
         for entry in list(self.mod_preview_index.values()):
@@ -940,7 +1067,7 @@ class MainWindow(QMainWindow):
 
         self.mods_table = ModsTableWidget(self)
         self.mods_table.setColumnCount(4)
-        self.mods_table.setHorizontalHeaderLabels(["Filename", "Update", "Size", "info.json"])
+        self.mods_table.setHorizontalHeaderLabels(["Name", "Tags", "Category", "Size"])
         self.mods_table.horizontalHeader().setStretchLastSection(True)
         self.mods_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.mods_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1008,28 +1135,43 @@ class MainWindow(QMainWindow):
         self.confirm_actions_checkbox = QCheckBox("Confirm actions", self)
         self.confirm_actions_checkbox.setChecked(self.confirm_actions_enabled)
         self.confirm_actions_checkbox.toggled.connect(self._on_confirm_actions_toggled)
+        self.download_watch_checkbox = QCheckBox("Download Watch", self)
+        self.download_watch_checkbox.setChecked(self.download_watch_enabled)
+        self.download_watch_checkbox.toggled.connect(self._on_download_watch_toggled)
+        self.sort_by_label = QLabel("Sort by:", self)
+        self.sort_by_combo = QComboBox(self)
+        self.sort_by_combo.addItem("Name", "name")
+        self.sort_by_combo.addItem("Tags", "tags")
+        self.sort_by_combo.addItem("Category", "category")
+        self.sort_by_combo.addItem("Size", "size")
+        sort_index = self.sort_by_combo.findData(self._normalized_sort_mode(self.mods_sort_mode))
+        self.sort_by_combo.setCurrentIndex(sort_index if sort_index >= 0 else 0)
+        self.sort_by_combo.currentIndexChanged.connect(self._on_sort_mode_changed)
         self.recheck_all_cache_btn = QPushButton("Recheck all images", self)
         self.recheck_all_cache_btn.clicked.connect(self._recheck_all_mod_images)
         self.verify_cache_btn = QPushButton("Verify cache", self)
         self.verify_cache_btn.clicked.connect(self._verify_preview_cache)
         self.clear_cache_btn = QPushButton("Clear cache", self)
         self.clear_cache_btn.clicked.connect(self._clear_preview_cache)
+        for button in (self.recheck_all_cache_btn, self.verify_cache_btn, self.clear_cache_btn):
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            button.setMinimumWidth(button.sizeHint().width())
 
         mods_toolbar = QWidget(self)
-        mods_toolbar_layout = QHBoxLayout(mods_toolbar)
-        mods_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        mods_toolbar_layout = FlowLayout(mods_toolbar, margin=0, h_spacing=6, v_spacing=4)
         mods_toolbar_layout.addWidget(self.text_view_btn)
         mods_toolbar_layout.addWidget(self.icon_view_btn)
-        mods_toolbar_layout.addSpacing(12)
         mods_toolbar_layout.addWidget(self.info_caption_checkbox)
         mods_toolbar_layout.addWidget(self.confirm_actions_checkbox)
-        mods_toolbar_layout.addSpacing(12)
+        mods_toolbar_layout.addWidget(self.download_watch_checkbox)
+        mods_toolbar_layout.addWidget(self.sort_by_label)
+        mods_toolbar_layout.addWidget(self.sort_by_combo)
         mods_toolbar_layout.addWidget(self.columns_label)
-        mods_toolbar_layout.addWidget(self.columns_slider, 0)
+        mods_toolbar_layout.addWidget(self.columns_slider)
         mods_toolbar_layout.addWidget(self.recheck_all_cache_btn)
         mods_toolbar_layout.addWidget(self.verify_cache_btn)
         mods_toolbar_layout.addWidget(self.clear_cache_btn)
-        mods_toolbar_layout.addStretch(1)
+        mods_toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         self.mods_stack = QStackedWidget(self)
         self.mods_stack.addWidget(self.mods_table)
@@ -1065,24 +1207,9 @@ class MainWindow(QMainWindow):
         self.beamng_status_indicator.setFixedSize(24, 24)
         self.beamng_status_indicator.setToolTip("BeamNG is not running.")
 
-        self.local_tab = QWidget(self)
-        local_layout = QVBoxLayout(self.local_tab)
-        local_layout.setContentsMargins(0, 0, 0, 0)
-        local_layout.addWidget(splitter)
-
-        self.online_tab = self._build_online_tab()
-        self.console_tab = self._build_console_tab()
-        self.main_tabs = QTabWidget(self)
-        self.main_tabs.setTabPosition(QTabWidget.North)
-        self.main_tabs.addTab(self.local_tab, "Local")
-        self.main_tabs.addTab(self.online_tab, "Online")
-        if self.online_debug_enabled:
-            self.main_tabs.addTab(self.console_tab, "Console")
-        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
-
         central = QWidget(self)
         layout = QVBoxLayout(central)
-        layout.addWidget(self.main_tabs, 1)
+        layout.addWidget(splitter, 1)
         status_row = QWidget(central)
         status_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         status_row_layout = QHBoxLayout(status_row)
@@ -1097,227 +1224,9 @@ class MainWindow(QMainWindow):
         self._load_view_preferences()
         self._install_interaction_filters()
 
-    def _build_online_tab(self) -> QWidget:
-        tab = QWidget(self)
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        toolbar = QWidget(tab)
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.online_repo_btn = QPushButton("Repo", toolbar)
-        self.online_forums_btn = QPushButton("Forums", toolbar)
-        self.online_back_btn = QPushButton("Back", toolbar)
-        self.online_forward_btn = QPushButton("Forward", toolbar)
-        self.online_refresh_btn = QPushButton("Refresh", toolbar)
-        self.online_dark_toggle_btn = QToolButton(toolbar)
-        self.online_dark_toggle_btn.setText("Dark Web")
-        self.online_dark_toggle_btn.setCheckable(True)
-        self.online_dark_toggle_btn.setChecked(self.online_dark_mode_enabled)
-        self.online_debug_checkbox = QCheckBox("Debug", toolbar)
-        self.online_debug_checkbox.setChecked(self.online_debug_enabled)
-        self.online_address_edit = QLineEdit(toolbar)
-        self.online_address_edit.setPlaceholderText("Enter URL...")
-        self.online_address_edit.setClearButtonEnabled(True)
-        self.online_go_btn = QPushButton("Go", toolbar)
-
-        for btn in [
-            self.online_repo_btn,
-            self.online_forums_btn,
-            self.online_back_btn,
-            self.online_forward_btn,
-            self.online_refresh_btn,
-            self.online_dark_toggle_btn,
-            self.online_debug_checkbox,
-        ]:
-            toolbar_layout.addWidget(btn)
-        toolbar_layout.addWidget(self.online_address_edit, 1)
-        toolbar_layout.addWidget(self.online_go_btn)
-        layout.addWidget(toolbar)
-
-        self.online_repo_btn.clicked.connect(self._open_online_repo)
-        self.online_forums_btn.clicked.connect(self._open_online_forums)
-        self.online_back_btn.clicked.connect(self._online_go_back)
-        self.online_forward_btn.clicked.connect(self._online_go_forward)
-        self.online_refresh_btn.clicked.connect(self._online_refresh)
-        self.online_dark_toggle_btn.toggled.connect(self._on_online_dark_toggled)
-        self.online_debug_checkbox.toggled.connect(self._on_online_debug_toggled)
-        self.online_go_btn.clicked.connect(self._navigate_online_from_address_bar)
-        self.online_address_edit.returnPressed.connect(self._navigate_online_from_address_bar)
-
-        if not self.online_available:
-            placeholder = QLabel(
-                "Qt WebEngine is not available in this environment.\n"
-                "Install a PySide6 distribution that includes QtWebEngine.",
-                tab,
-            )
-            placeholder.setAlignment(Qt.AlignCenter)
-            layout.addWidget(placeholder, 1)
-            for btn in [
-                self.online_repo_btn,
-                self.online_forums_btn,
-                self.online_back_btn,
-                self.online_forward_btn,
-                self.online_refresh_btn,
-                self.online_dark_toggle_btn,
-                self.online_address_edit,
-                self.online_go_btn,
-            ]:
-                btn.setEnabled(False)
-            return tab
-
-        project_root = Path(__file__).resolve().parents[1]
-        webview_cache_root = project_root / ".cache" / "webview"
-        cache_path = webview_cache_root / "http_cache"
-        storage_path = webview_cache_root / "storage"
-        cache_path.mkdir(parents=True, exist_ok=True)
-        storage_path.mkdir(parents=True, exist_ok=True)
-
-        profile = QWebEngineProfile("BeamNGManagerOnline", self)
-        profile.setCachePath(str(cache_path))
-        profile.setPersistentStoragePath(str(storage_path))
-        profile.setHttpCacheMaximumSize(_webengine_cache_bytes(self.online_cache_max_mb))
-        self.online_profile = profile
-
-        self.online_view = QWebEngineView(tab)
-        # Keep page parented to profile so profile teardown can safely dispose it first.
-        self.online_page = OnlineWebPage(profile, self._handle_online_navigation, profile)
-        self.online_view.setPage(self.online_page)
-        self.online_view.urlChanged.connect(self._on_online_url_changed)
-        self.online_page.linkHovered.connect(self._on_online_link_hovered)
-        self.online_view.loadFinished.connect(self._on_online_page_load_finished)
-        default_url = "https://www.beamng.com/resources/"
-        self.online_current_url = default_url
-        self.online_address_edit.setText(default_url)
-        self.online_view.setUrl(QUrl(default_url))
-        self._update_online_nav_buttons()
-        layout.addWidget(self.online_view, 1)
-        return tab
-
-    def _build_console_tab(self) -> QWidget:
-        tab = QWidget(self)
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        controls = QWidget(tab)
-        controls_layout = QHBoxLayout(controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        clear_btn = QPushButton("Clear", controls)
-        clear_btn.clicked.connect(self._clear_online_console)
-        controls_layout.addWidget(clear_btn)
-        controls_layout.addStretch(1)
-
-        self.online_console_box = QPlainTextEdit(tab)
-        self.online_console_box.setReadOnly(True)
-        self.online_console_box.setLineWrapMode(QPlainTextEdit.NoWrap)
-
-        layout.addWidget(controls)
-        layout.addWidget(self.online_console_box, 1)
-        return tab
-
-    def _open_online_repo(self) -> None:
-        if self.online_view is None:
-            return
-        self.online_view.setUrl(QUrl("https://www.beamng.com/resources/"))
-
-    def _open_online_forums(self) -> None:
-        if self.online_view is None:
-            return
-        self.online_view.setUrl(QUrl("https://www.beamng.com/forums/"))
-
-    def _online_go_back(self) -> None:
-        if self.online_view is None:
-            return
-        try:
-            history = self.online_view.history()
-            if history.canGoBack():
-                history.back()
-                return
-        except Exception:
-            pass
-        if self.online_page is not None:
-            self.online_page.runJavaScript("if (window.history.length > 1) { history.back(); }")
-            return
-        self._set_status_line3("No previous page in history.")
-
-    def _online_go_forward(self) -> None:
-        if self.online_view is None:
-            return
-        try:
-            history = self.online_view.history()
-            if history.canGoForward():
-                history.forward()
-                return
-        except Exception:
-            pass
-        if self.online_page is not None:
-            self.online_page.runJavaScript("history.forward();")
-            return
-        self._set_status_line3("No next page in history.")
-
-    def _online_refresh(self) -> None:
-        if self.online_view is None:
-            return
-        self.online_view.reload()
-
-    def _normalize_online_input_url(self, raw_value: str) -> str:
-        value = str(raw_value or "").strip()
-        if not value:
-            return ""
-        lower = value.lower()
-        if lower.startswith("http://") or lower.startswith("https://"):
-            return value
-        if lower.startswith("www."):
-            return f"https://{value}"
-        if "://" in value:
-            return value
-        return f"https://{value}"
-
-    def _navigate_online_from_address_bar(self) -> None:
-        if self.online_view is None:
-            return
-        if not hasattr(self, "online_address_edit"):
-            return
-        target_text = self._normalize_online_input_url(self.online_address_edit.text())
-        if not target_text:
-            return
-        target_url = QUrl(target_text)
-        if not target_url.isValid():
-            self._set_status_line3(f"Invalid URL: {target_text}")
-            return
-        self.online_view.setUrl(target_url)
-
-    def _is_online_tab_active(self) -> bool:
-        return hasattr(self, "main_tabs") and self.main_tabs.currentWidget() is self.online_tab
-
     def _render_status(self, line1: str, line2: str, line3: str) -> None:
         self.status_box.setPlainText(f"{line1}\n{line2}\n{line3}")
         self._update_status_box_height()
-
-    def _set_online_status(self) -> None:
-        self._render_status(self.online_current_url, self.online_status_line2, self.online_hover_url)
-
-    def _set_online_status_line2(self, message: str) -> None:
-        self.online_status_line2 = message
-        if self._is_online_tab_active():
-            self._set_online_status()
-
-    def _refresh_local_status_display(self) -> None:
-        if self._selected_mod_paths():
-            self._on_mod_selection_changed()
-            return
-        items = self.left_tree.selectedItems()
-        if items:
-            self._status_for_folder(items[0], len(self._mods_for_left_item(items[0])))
-        else:
-            self._update_summary_status()
-
-    def _on_main_tab_changed(self, _index: int) -> None:
-        if self._is_online_tab_active():
-            self._set_online_status()
-            return
-        self._refresh_local_status_display()
 
     def _left_item_signature(self, item: QTreeWidgetItem | None) -> tuple[str, str]:
         if item is None:
@@ -1424,129 +1333,6 @@ class MainWindow(QMainWindow):
             self._setting_splitter_sizes = False
         self._left_splitter_initialized = True
 
-    def _on_online_url_changed(self, url: QUrl) -> None:
-        self.online_current_url = url.toString()
-        if hasattr(self, "online_address_edit"):
-            self.online_address_edit.blockSignals(True)
-            self.online_address_edit.setText(self.online_current_url)
-            self.online_address_edit.blockSignals(False)
-        self._update_online_nav_buttons()
-        if self._is_online_tab_active():
-            self._set_online_status()
-
-    def _update_online_nav_buttons(self) -> None:
-        if not hasattr(self, "online_back_btn") or not hasattr(self, "online_forward_btn"):
-            return
-        if self.online_view is None:
-            self.online_back_btn.setEnabled(False)
-            self.online_forward_btn.setEnabled(False)
-            return
-        can_back = False
-        can_forward = False
-        try:
-            history = self.online_view.history()
-            can_back = bool(history.canGoBack())
-            can_forward = bool(history.canGoForward())
-        except Exception:
-            pass
-        self.online_back_btn.setEnabled(can_back)
-        self.online_forward_btn.setEnabled(can_forward)
-
-    def _on_online_link_hovered(self, url: str) -> None:
-        self.online_hover_url = (url or "").strip()
-        if self._is_online_tab_active():
-            self._set_online_status()
-
-    def _emit_online_console_log(self, message: str) -> None:
-        self.onlineConsoleLog.emit(str(message))
-
-    def _show_online_request_error_dialog(self, message: str) -> bool:
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.NoIcon)
-        box.setWindowTitle("Online Request Error")
-        box.setText("A web request failed.")
-        box.setInformativeText(str(message))
-        stop_btn = box.addButton("Stop", QMessageBox.RejectRole)
-        continue_btn = box.addButton("Continue", QMessageBox.AcceptRole)
-        box.setDefaultButton(continue_btn)
-        box.exec()
-        return box.clickedButton() is continue_btn
-
-    def _decide_online_request_error(self, message: str) -> bool:
-        if threading.current_thread() is threading.main_thread():
-            return self._show_online_request_error_dialog(message)
-        token = next(self._online_error_prompt_seq)
-        waiter = threading.Event()
-        holder = {"continue": True}
-        with self._online_error_prompt_lock:
-            self._online_error_prompt_waiters[token] = (waiter, holder)
-        self.onlineRequestErrorPrompt.emit(token, str(message))
-        if waiter.wait(timeout=_ONLINE_REQUEST_PROMPT_TIMEOUT_SECONDS):
-            return bool(holder.get("continue", True))
-        with self._online_error_prompt_lock:
-            pair = self._online_error_prompt_waiters.pop(token, None)
-        if pair is not None:
-            timeout_waiter, timeout_holder = pair
-            timeout_holder["continue"] = False
-            timeout_waiter.set()
-            return False
-        return bool(holder.get("continue", False))
-
-    def _flush_online_error_waiters(self, default_continue: bool = False) -> None:
-        with self._online_error_prompt_lock:
-            waiters = list(self._online_error_prompt_waiters.values())
-            self._online_error_prompt_waiters.clear()
-        for waiter, holder in waiters:
-            holder["continue"] = bool(default_continue)
-            waiter.set()
-
-    def _on_online_request_error_prompt(self, token: int, message: str) -> None:
-        decision = self._show_online_request_error_dialog(message)
-        with self._online_error_prompt_lock:
-            pair = self._online_error_prompt_waiters.pop(int(token), None)
-        if pair is None:
-            return
-        waiter, holder = pair
-        holder["continue"] = bool(decision)
-        waiter.set()
-
-    def _append_online_console_line(self, message: str) -> None:
-        if not self.online_debug_enabled or not hasattr(self, "online_console_box"):
-            return
-        stamp = QDateTime.currentDateTime().toString("HH:mm:ss")
-        self.online_console_box.appendPlainText(f"[{stamp}] {message}")
-
-    def _clear_online_console(self) -> None:
-        if hasattr(self, "online_console_box"):
-            self.online_console_box.clear()
-
-    def _set_console_tab_visible(self, visible: bool) -> None:
-        if not hasattr(self, "main_tabs") or not hasattr(self, "console_tab"):
-            return
-        idx = self.main_tabs.indexOf(self.console_tab)
-        if visible and idx < 0:
-            self.main_tabs.addTab(self.console_tab, "Console")
-            return
-        if not visible and idx >= 0:
-            was_current = self.main_tabs.currentWidget() is self.console_tab
-            self.main_tabs.removeTab(idx)
-            if was_current:
-                self.main_tabs.setCurrentWidget(self.online_tab)
-
-    def _on_online_debug_toggled(self, checked: bool) -> None:
-        self.online_debug_enabled = bool(checked)
-        self.settings_store.setValue("online_debug_enabled", bool(checked))
-        if self.online_client is not None:
-            self.online_client.set_debug_logging(
-                self.online_debug_enabled,
-                self._emit_online_console_log if self.online_debug_enabled else None,
-            )
-        if self.online_debug_enabled:
-            self._set_console_tab_visible(True)
-            self._emit_online_console_log("Debug logging enabled.")
-        else:
-            self._set_console_tab_visible(False)
-
     def _db_entry_tag_id(self, value: dict[str, object]) -> str:
         direct = str(value.get("modID") or value.get("tagid") or "").strip()
         if direct:
@@ -1593,371 +1379,6 @@ class MainWindow(QMainWindow):
         manual_tag_ids.difference_update(subscribed_tag_ids)
         return subscribed_tokens, manual_tokens, subscribed_tag_ids, manual_tag_ids
 
-    def _online_installed_indicator_script(
-        self,
-        subscribed_tokens: set[str],
-        manual_tokens: set[str],
-        subscribed_tag_ids: set[str],
-        manual_tag_ids: set[str],
-    ) -> str:
-        subscribed_tokens_json = json.dumps(
-            sorted({str(token).strip().lower() for token in subscribed_tokens if str(token).strip()})
-        )
-        manual_tokens_json = json.dumps(sorted({str(token).strip().lower() for token in manual_tokens if str(token).strip()}))
-        subscribed_tag_ids_json = json.dumps(
-            sorted({str(tag_id).strip().lower() for tag_id in subscribed_tag_ids if str(tag_id).strip()})
-        )
-        manual_tag_ids_json = json.dumps(sorted({str(tag_id).strip().lower() for tag_id in manual_tag_ids if str(tag_id).strip()}))
-        return (
-            "(() => {\n"
-            f"  const subscribedTokens = new Set({subscribed_tokens_json});\n"
-            f"  const manualTokens = new Set({manual_tokens_json});\n"
-            f"  const subscribedTagIds = new Set({subscribed_tag_ids_json});\n"
-            f"  const manualTagIds = new Set({manual_tag_ids_json});\n"
-            "  const styleId = 'beamng-manager-installed-style';\n"
-            "  const markerAttr = 'data-beamng-manager-install-kind';\n"
-            "  const cardAttr = 'data-beamng-manager-install-kind-card';\n"
-            "  const pageBadgeId = 'beamng-manager-installed-page-badge';\n"
-            "  const listCardSelector = '.resourceListItem, .structItem--resource, .structItem, .resourceRow';\n"
-            "  const titleTagPattern = /\\s*\\|\\s*(Installed on this PC|Subscribed|Manually Installed)\\s*$/i;\n"
-            "  const statusLabel = (kind) => (kind === 'subscribed' ? 'Subscribed' : (kind === 'manual' ? 'Manually Installed' : ''));\n"
-            "  const isResourceDetailPage = (() => {\n"
-            "    const parts = (window.location.pathname || '').split('/').filter(Boolean).map((p) => p.toLowerCase());\n"
-            "    if (parts.length < 2) return false;\n"
-            "    if (parts[0] !== 'resources') return false;\n"
-            "    const second = parts[1] || '';\n"
-            "    if (!second) return false;\n"
-            "    if (new Set(['authors', 'categories', 'reviews']).has(second)) return false;\n"
-            "    return true;\n"
-            "  })();\n"
-            "  const ensureStyle = () => {\n"
-            "    let style = document.getElementById(styleId);\n"
-            "    if (style) return;\n"
-            "    style = document.createElement('style');\n"
-            "    style.id = styleId;\n"
-            "    style.textContent = `\n"
-            "a[data-beamng-manager-install-kind=\"subscribed\"] {\n"
-            "  box-shadow: inset 0 0 0 2px rgba(255, 216, 77, 0.92) !important;\n"
-            "  border-radius: 4px !important;\n"
-            "}\n"
-            "a[data-beamng-manager-install-kind=\"manual\"] {\n"
-            "  box-shadow: inset 0 0 0 2px rgba(225, 68, 68, 0.92) !important;\n"
-            "  border-radius: 4px !important;\n"
-            "}\n"
-            "[data-beamng-manager-install-kind-card=\"subscribed\"] {\n"
-            "  position: relative !important;\n"
-            "  box-shadow: inset 0 0 0 1px rgba(255, 216, 77, 0.75) !important;\n"
-            "  border-radius: 6px !important;\n"
-            "}\n"
-            "[data-beamng-manager-install-kind-card=\"manual\"] {\n"
-            "  position: relative !important;\n"
-            "  box-shadow: inset 0 0 0 1px rgba(225, 68, 68, 0.8) !important;\n"
-            "  border-radius: 6px !important;\n"
-            "}\n"
-            "#beamng-manager-installed-page-badge {\n"
-            "  display: inline-block !important;\n"
-            "  margin: 8px 0 10px 0 !important;\n"
-            "  padding: 4px 10px !important;\n"
-            "  border-radius: 999px !important;\n"
-            "  font-size: 12px !important;\n"
-            "  font-weight: 700 !important;\n"
-            "}\n"
-            "#beamng-manager-installed-page-badge[data-kind=\"subscribed\"] {\n"
-            "  background: rgba(255, 216, 77, 0.2) !important;\n"
-            "  border: 1px solid rgba(255, 216, 77, 0.7) !important;\n"
-            "  color: #ffd84d !important;\n"
-            "}\n"
-            "#beamng-manager-installed-page-badge[data-kind=\"manual\"] {\n"
-            "  background: rgba(225, 68, 68, 0.22) !important;\n"
-            "  border: 1px solid rgba(225, 68, 68, 0.78) !important;\n"
-            "  color: #ff8c8c !important;\n"
-            "}\n"
-            "    `;\n"
-            "    (document.head || document.documentElement).appendChild(style);\n"
-            "  };\n"
-            "  const extractDirectResourceToken = (value) => {\n"
-            "    const raw = String(value || '').trim();\n"
-            "    if (!raw) return '';\n"
-            "    let parsed;\n"
-            "    try {\n"
-            "      parsed = new URL(raw, document.baseURI || window.location.href);\n"
-            "    } catch (_err) {\n"
-            "      return '';\n"
-            "    }\n"
-            "    const parts = parsed.pathname.split('/').filter(Boolean);\n"
-            "    const idx = parts.findIndex((part) => part.toLowerCase() === 'resources');\n"
-            "    if (idx < 0 || idx + 1 >= parts.length) return '';\n"
-            "    if (idx + 2 !== parts.length) return '';\n"
-            "    const token = String(parts[idx + 1] || '').trim().toLowerCase();\n"
-            "    if (!token || token === 'download') return '';\n"
-            "    if (new Set(['authors', 'categories', 'reviews']).has(token)) return '';\n"
-            "    return token;\n"
-            "  };\n"
-            "  const kindFromToken = (token) => {\n"
-            "    const value = String(token || '').trim().toLowerCase();\n"
-            "    if (!value) return '';\n"
-            "    if (subscribedTokens.has(value)) return 'subscribed';\n"
-            "    if (manualTokens.has(value)) return 'manual';\n"
-            "    const maybeId = value.match(/\\.([0-9]+)$/);\n"
-            "    if (maybeId) {\n"
-            "      const id = maybeId[1];\n"
-            "      if (subscribedTokens.has(id)) return 'subscribed';\n"
-            "      if (manualTokens.has(id)) return 'manual';\n"
-            "    }\n"
-            "    return '';\n"
-            "  };\n"
-            "  const installedKind = (href) => {\n"
-            "    const raw = String(href || '').trim();\n"
-            "    if (!raw) return '';\n"
-            "    const protocolMatch = raw.match(/^beamng:v1\\/(?:subscriptionMod|showMod)\\/([A-Za-z0-9_]+)/i);\n"
-            "    if (protocolMatch && protocolMatch[1]) {\n"
-            "      const tag = protocolMatch[1].toLowerCase();\n"
-            "      if (subscribedTagIds.has(tag)) return 'subscribed';\n"
-            "      if (manualTagIds.has(tag)) return 'manual';\n"
-            "    }\n"
-            "    const token = extractDirectResourceToken(raw);\n"
-            "    if (!token) return '';\n"
-            "    return kindFromToken(token);\n"
-            "  };\n"
-            "  const isListBadgeEligibleAnchor = (anchor) => {\n"
-            "    if (!(anchor instanceof HTMLAnchorElement)) return false;\n"
-            "    if (anchor.classList.contains('resourceIcon')) return true;\n"
-            "    if (anchor.closest('h3.title, .resourceTitle, .structItem-title, .resourceBody h3, .resourceBody .title')) return true;\n"
-            "    return false;\n"
-            "  };\n"
-            "  const syncAnchor = (anchor) => {\n"
-            "    if (!(anchor instanceof HTMLAnchorElement)) return;\n"
-            "    if (isResourceDetailPage || !isListBadgeEligibleAnchor(anchor)) {\n"
-            "      anchor.removeAttribute(markerAttr);\n"
-            "      anchor.title = String(anchor.title || '').replace(titleTagPattern, '').trim();\n"
-            "      return;\n"
-            "    }\n"
-            "    const kind = installedKind(anchor.getAttribute('href'));\n"
-            "    if (kind) {\n"
-            "      anchor.setAttribute(markerAttr, kind);\n"
-            "      const cleanedTitle = String(anchor.title || '').replace(titleTagPattern, '').trim();\n"
-            "      const label = statusLabel(kind);\n"
-            "      anchor.title = cleanedTitle ? `${cleanedTitle} | ${label}` : label;\n"
-            "      return;\n"
-            "    }\n"
-            "    anchor.removeAttribute(markerAttr);\n"
-            "    anchor.title = String(anchor.title || '').replace(titleTagPattern, '').trim();\n"
-            "  };\n"
-            "  const syncPageBadge = () => {\n"
-            "    const existing = document.getElementById(pageBadgeId);\n"
-            "    if (existing) existing.remove();\n"
-            "    const kind = installedKind(window.location.href);\n"
-            "    if (!kind) return;\n"
-            "    const title = document.querySelector('h1, .p-title-value, .resourceTitle, .PageTitle');\n"
-            "    if (!title || !title.parentElement) return;\n"
-            "    const badge = document.createElement('div');\n"
-            "    badge.id = pageBadgeId;\n"
-            "    badge.setAttribute('data-kind', kind);\n"
-            "    badge.textContent = statusLabel(kind);\n"
-            "    title.parentElement.insertBefore(badge, title.nextSibling);\n"
-            "  };\n"
-            "  const syncCard = (card) => {\n"
-            "    if (!(card instanceof Element)) return;\n"
-            "    if (isResourceDetailPage) {\n"
-            "      card.removeAttribute(cardAttr);\n"
-            "      return;\n"
-            "    }\n"
-            "    const links = card.querySelectorAll('a[href]');\n"
-            "    let kind = '';\n"
-            "    for (const anchor of Array.from(links)) {\n"
-            "      const current = installedKind(anchor.getAttribute('href'));\n"
-            "      if (current === 'subscribed') {\n"
-            "        kind = 'subscribed';\n"
-            "        break;\n"
-            "      }\n"
-            "      if (current === 'manual') {\n"
-            "        kind = 'manual';\n"
-            "      }\n"
-            "    }\n"
-            "    if (kind) {\n"
-            "      card.setAttribute(cardAttr, kind);\n"
-            "      return;\n"
-            "    }\n"
-            "    card.removeAttribute(cardAttr);\n"
-            "  };\n"
-            "  const scan = (scope) => {\n"
-            "    const root = scope || document;\n"
-            "    if (!root.querySelectorAll) return;\n"
-            "    root.querySelectorAll('a[href]').forEach((anchor) => syncAnchor(anchor));\n"
-            "    root.querySelectorAll(listCardSelector).forEach((card) => syncCard(card));\n"
-            "  };\n"
-            "  ensureStyle();\n"
-            "  scan(document);\n"
-            "  syncPageBadge();\n"
-            "  try {\n"
-            "    const prev = window.__beamngManagerInstalledObserver;\n"
-            "    if (prev && typeof prev.disconnect === 'function') prev.disconnect();\n"
-            "  } catch (_err) {}\n"
-            "  const observer = new MutationObserver((mutations) => {\n"
-            "    for (const mutation of mutations) {\n"
-            "      for (const node of Array.from(mutation.addedNodes || [])) {\n"
-            "        if (!(node instanceof Element)) continue;\n"
-            "        if (node.matches && node.matches('a[href]')) syncAnchor(node);\n"
-            "        scan(node);\n"
-            "      }\n"
-            "    }\n"
-            "    syncPageBadge();\n"
-            "  });\n"
-            "  if (document.body || document.documentElement) {\n"
-            "    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });\n"
-            "    window.__beamngManagerInstalledObserver = observer;\n"
-            "  }\n"
-            "})();\n"
-        )
-
-    def _refresh_online_installed_indicators(self) -> None:
-        if self.online_page is None or not self.online_available:
-            return
-        subscribed_tokens, manual_tokens, subscribed_tag_ids, manual_tag_ids = self._online_installed_marker_sets()
-        self.online_page.runJavaScript(
-            self._online_installed_indicator_script(
-                subscribed_tokens,
-                manual_tokens,
-                subscribed_tag_ids,
-                manual_tag_ids,
-            )
-        )
-
-    def _online_dark_mode_script(self, enabled: bool) -> str:
-        state = "true" if enabled else "false"
-        return f"""
-(() => {{
-  const enabled = {state};
-  const styleId = "beamng-manager-dark-style";
-  const attrName = "data-beamng-manager-dark";
-  const ensureStyle = () => {{
-    let style = document.getElementById(styleId);
-    if (!style) {{
-      style = document.createElement("style");
-      style.id = styleId;
-      style.textContent = `
-html[${{attrName}}="1"] {{
-  color-scheme: dark !important;
-  background: #0f1218 !important;
-}}
-html[${{attrName}}="1"] body {{
-  background: #0f1218 !important;
-  color: #e7ecf3 !important;
-  text-shadow: none !important;
-  -webkit-font-smoothing: antialiased !important;
-  text-rendering: optimizeLegibility !important;
-}}
-html[${{attrName}}="1"] :is(main, section, article, aside, nav, header, footer, form, fieldset, details, summary, ul, ol, li, table, tr, td, th, blockquote, pre, code) {{
-  background-color: transparent !important;
-  color: inherit !important;
-}}
-html[${{attrName}}="1"] :is(
-  [role="dialog"],
-  [role="menu"],
-  [role="listbox"],
-  dialog,
-  .modal,
-  .overlay,
-  .popup,
-  .popover,
-  .tooltip,
-  .menu,
-  .dropdown-menu,
-  .xenOverlay,
-  .xenOverlayContainer
-) {{
-  background: #1a2130 !important;
-  color: #edf2ff !important;
-  border-color: #3d4b63 !important;
-  opacity: 1 !important;
-}}
-html[${{attrName}}="1"] :is(h1, h2, h3, h4, h5, h6, strong, b) {{
-  color: #f5f8ff !important;
-}}
-html[${{attrName}}="1"] :is(p, span, li, dt, dd, label, small, cite, em) {{
-  color: #d8dee8 !important;
-}}
-html[${{attrName}}="1"] a {{
-  color: #7db3ff !important;
-}}
-html[${{attrName}}="1"] a:visited {{
-  color: #b59bff !important;
-}}
-html[${{attrName}}="1"] a:hover {{
-  color: #9ec8ff !important;
-}}
-html[${{attrName}}="1"] :is(input, textarea, select, button) {{
-  background: #1a2130 !important;
-  color: #edf2ff !important;
-  border: 1px solid #3d4b63 !important;
-}}
-html[${{attrName}}="1"] :is(input::placeholder, textarea::placeholder) {{
-  color: #9ba7bd !important;
-}}
-html[${{attrName}}="1"] :is(pre, code, kbd, samp) {{
-  background: #161d29 !important;
-  color: #e5ecfa !important;
-  border-color: #334159 !important;
-}}
-html[${{attrName}}="1"] :is(table, th, td) {{
-  border-color: #36445c !important;
-}}
-html[${{attrName}}="1"] :is(hr) {{
-  border-color: #2f3b4e !important;
-}}
-html[${{attrName}}="1"] :is(.primaryContent, .secondaryContent, .messageContent, .sidebar, .resourceBody, .resourceTabs, .tabs, .section, .block) {{
-  background: #111826 !important;
-  color: #e1e8f5 !important;
-  border-color: #334159 !important;
-}}
-html[${{attrName}}="1"] img,
-html[${{attrName}}="1"] picture,
-html[${{attrName}}="1"] video,
-html[${{attrName}}="1"] canvas,
-html[${{attrName}}="1"] svg {{
-  filter: none !important;
-}}
-      `;
-      (document.head || document.documentElement).appendChild(style);
-    }}
-  }};
-  if (enabled) {{
-    ensureStyle();
-    document.documentElement.setAttribute(attrName, "1");
-    document.documentElement.style.colorScheme = "dark";
-    document.body && (document.body.style.backgroundColor = "#0f1218");
-    document.body && (document.body.style.color = "#e7ecf3");
-  }} else {{
-    document.documentElement.removeAttribute(attrName);
-    document.documentElement.style.colorScheme = "";
-    if (document.body) {{
-      document.body.style.backgroundColor = "";
-      document.body.style.color = "";
-    }}
-  }}
-}})();
-"""
-
-    def _apply_online_dark_mode(self, enabled: bool, persist: bool = True) -> None:
-        self.online_dark_mode_enabled = bool(enabled)
-        if persist:
-            self.settings_store.setValue("online_dark_mode", bool(enabled))
-        if self.online_page is None:
-            return
-        self.online_page.runJavaScript(self._online_dark_mode_script(bool(enabled)))
-
-    def _on_online_dark_toggled(self, checked: bool) -> None:
-        self._apply_online_dark_mode(checked, persist=True)
-        state = "enabled" if checked else "disabled"
-        self._set_status_line3(f"Online dark mode {state}.")
-
-    def _on_online_page_load_finished(self, ok: bool) -> None:
-        if not ok:
-            return
-        self._apply_online_dark_mode(self.online_dark_mode_enabled, persist=False)
-        self._refresh_online_installed_indicators()
-        self._update_online_nav_buttons()
-
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, "mods_stack") and self.mods_stack.currentWidget() is self.mods_icons:
@@ -1977,25 +1398,10 @@ html[${{attrName}}="1"] svg {{
                 )
                 event.ignore()
                 return
-        self._flush_online_error_waiters(default_continue=False)
         self._shutdown_beamng_status_poller()
-        # Ensure page is detached before profile deletion to avoid WebEngine lifecycle warnings.
-        if self.online_view is not None and self.online_page is not None and WEBENGINE_AVAILABLE:
-            try:
-                self.online_view.setPage(QWebEnginePage(self.online_view))
-            except Exception:
-                pass
-            try:
-                self.online_page.deleteLater()
-            except Exception:
-                pass
-            self.online_page = None
-        if self.online_profile is not None:
-            try:
-                self.online_profile.deleteLater()
-            except Exception:
-                pass
-            self.online_profile = None
+        self._bridge_events_timer.stop()
+        self._stop_firefox_bridge_server()
+        self._save_mod_info_cache()
         super().closeEvent(event)
 
     def _shutdown_beamng_status_poller(self) -> None:
@@ -2255,8 +1661,92 @@ html[${{attrName}}="1"] svg {{
     def _on_info_caption_toggle(self, checked: bool) -> None:
         self.info_caption_enabled = bool(checked)
         self.settings_store.setValue("info_caption_enabled", self.info_caption_enabled)
-        if self._is_icon_view_active():
-            self._populate_mods_icons(self.current_mod_entries)
+        self.current_mod_entries = self._sorted_mod_entries(self.current_mod_entries)
+        self._repopulate_current_mod_view()
+
+    def _refresh_table_name_labels(self) -> None:
+        if self.mods_table.rowCount() <= 0:
+            return
+        self._updating_mod_table = True
+        try:
+            for path_raw, row in self._mod_row_by_path.items():
+                if row < 0 or row >= self.mods_table.rowCount():
+                    continue
+                cell = self.mods_table.item(row, 0)
+                if cell is None:
+                    continue
+                file_name = Path(str(path_raw)).name
+                cell.setText(self._display_mod_name_for_table(path_raw, file_name))
+        finally:
+            self._updating_mod_table = False
+
+    def _normalized_sort_mode(self, value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode == "info_name":
+            # Backward compatibility with older saved setting.
+            return "name"
+        if mode not in {"name", "tags", "category", "size"}:
+            return "name"
+        return mode
+
+    def _sort_info_label_for_analysis(self, analysis, fallback_name: str) -> str:
+        data = analysis.summary_fields if hasattr(analysis, "summary_fields") else None
+        if isinstance(data, dict):
+            for key in ("title", "Title", "Name", "name", "prefix_title", "tagline", "description"):
+                value = str(data.get(key, "")).strip()
+                if value:
+                    return value
+        return str(fallback_name)
+
+    def _populate_sort_metadata(self, mods: list[ModEntry]) -> None:
+        for mod in mods:
+            path_key = str(mod.path)
+            analysis = get_info_json_analysis_cached(mod.path, self.mod_info_cache)
+            self._mod_prefix_by_path[path_key] = self._extract_prefix_value(analysis.summary_fields)
+            self._mod_category_by_path[path_key] = self._repo_category_badge_label(mod, analysis)
+            self._mod_info_label_by_path[path_key] = self._sort_info_label_for_analysis(analysis, mod.path.name)
+
+    def _sorted_mod_entries(self, mods: list[ModEntry]) -> list[ModEntry]:
+        mode = self._normalized_sort_mode(self.mods_sort_mode)
+        mods_list = list(mods)
+        if mode in {"tags", "category"} or (mode == "name" and self.info_caption_checkbox.isChecked()):
+            self._populate_sort_metadata(mods_list)
+        elif mode == "size" and self.info_caption_checkbox.isChecked():
+            self._populate_sort_metadata(mods_list)
+
+        def _display_name_key(mod: ModEntry, path_key: str, name_key: str) -> tuple[str, str]:
+            shown = self._display_mod_name_for_table(path_key, mod.path.name).strip().lower()
+            return (shown, name_key) if shown else (name_key, name_key)
+
+        def _key(mod: ModEntry):
+            path_key = str(mod.path)
+            name_key = mod.path.name.lower()
+            display_key = _display_name_key(mod, path_key, name_key)
+            if mode == "name":
+                return display_key
+            if mode == "tags":
+                tag = str(self._mod_prefix_by_path.get(path_key, "")).strip().lower()
+                return (0, tag, *display_key) if tag else (1, "", *display_key)
+            if mode == "category":
+                category = str(self._mod_category_by_path.get(path_key, "")).strip().lower()
+                return (0, category, *display_key) if category else (1, "", *display_key)
+            if mode == "size":
+                return (int(mod.size), *display_key)
+            return (name_key,)
+
+        return sorted(mods_list, key=_key)
+
+    def _on_sort_mode_changed(self, _index: int) -> None:
+        if not hasattr(self, "sort_by_combo"):
+            return
+        mode = self._normalized_sort_mode(str(self.sort_by_combo.currentData() or "name"))
+        if mode == self.mods_sort_mode:
+            return
+        self.mods_sort_mode = mode
+        self.settings_store.setValue("mods_sort_mode", mode)
+        self.current_mod_entries = self._sorted_mod_entries(self.current_mod_entries)
+        self._repopulate_current_mod_view()
+        self._set_status_line3(f"Sort mode: {self.sort_by_combo.currentText()}.")
 
     def _persist_view_preferences(self) -> None:
         if self._loading_view_preferences:
@@ -2339,6 +1829,10 @@ html[${{attrName}}="1"] svg {{
                 if image_label is not None:
                     image_label.setFixedHeight(image_height)
                     image_label.setGeometry(0, 0, preview_width, image_height)
+                    mod_path_raw = str(holder.property("mod_path") or "").strip()
+                    source_pixmap = self._icon_source_pixmap_by_path.get(mod_path_raw)
+                    if source_pixmap is not None and not source_pixmap.isNull():
+                        image_label.setPixmap(self._fit_preview_pixmap(source_pixmap, QSize(preview_width, image_height)))
                 name_label = holder.findChild(ElidedLabel, "icon_name_label")
                 if name_label is not None:
                     name_label.setFixedHeight(caption_height)
@@ -2350,6 +1844,10 @@ html[${{attrName}}="1"] svg {{
                 if prefix_badge is not None and prefix_badge.isVisible():
                     prefix_badge.adjustSize()
                     prefix_badge.move(max(6, preview_width - prefix_badge.width() - 6), max(6, image_height - prefix_badge.height() - 6))
+                category_badge = holder.findChild(QLabel, "category_badge_label")
+                if category_badge is not None and category_badge.isVisible():
+                    category_badge.adjustSize()
+                    category_badge.move(max(6, preview_width - category_badge.width() - 6), 6)
                 active_btn = holder.findChild(QToolButton, "active_indicator_btn")
                 if active_btn is not None:
                     active_btn.move(6, 6)
@@ -2461,11 +1959,188 @@ html[${{attrName}}="1"] svg {{
                 return value
         return ""
 
-    def _format_mod_name_with_prefix(self, file_name: str, prefix: str) -> str:
-        prefix_text = str(prefix).strip()
-        if not prefix_text:
-            return file_name
-        return f"{file_name} [{prefix_text}]"
+    def _coerce_repo_category_id(self, value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            if not value.is_integer():
+                return None
+            return int(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+        return None
+
+    def _repo_category_label_from_value(self, value: object) -> str:
+        category_id = self._coerce_repo_category_id(value)
+        if category_id is not None:
+            return _REPO_CATEGORY_LABEL_BY_ID.get(int(category_id), "")
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        normalized = re.sub(r"[^a-z0-9]+", "", text.lower())
+        label_aliases = {
+            "vehicles": "Vehicles",
+            "land": "Land",
+            "air": "Air",
+            "props": "Props",
+            "boats": "Boats",
+            "modsofmods": "Mods of Mods",
+            "scenarios": "Scenarios",
+            "terrainslevelsmaps": "Terrains/Levels/Maps",
+            "terrains": "Terrains/Levels/Maps",
+            "levels": "Terrains/Levels/Maps",
+            "maps": "Terrains/Levels/Maps",
+            "uiapps": "UI Apps",
+            "userinterfaceapps": "UI Apps",
+            "skins": "Skins",
+            "sounds": "Sounds",
+            "configurations": "Configurations",
+            "licenseplates": "License Plates",
+            "automation": "Automation",
+            "trackbuilder": "Track Builder",
+        }
+        return label_aliases.get(normalized, "")
+
+    def _extract_repo_category_label_from_value(self, root: object) -> str:
+        stack: list[object] = [root]
+        visited: set[int] = set()
+        candidate_keys = {
+            "category",
+            "categoryid",
+            "resourcecategoryid",
+            "resourcecategory",
+            "repocategory",
+        }
+        while stack:
+            current = stack.pop()
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            if isinstance(current, dict):
+                for key, nested in current.items():
+                    normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+                    if normalized_key in candidate_keys:
+                        label = self._repo_category_label_from_value(nested)
+                        if label:
+                            return label
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+                continue
+            if isinstance(current, list):
+                for nested in current:
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+        return ""
+
+    def _category_label_from_type_hint(self, type_text: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "", str(type_text or "").lower())
+        if not normalized:
+            return ""
+        if any(token in normalized for token in ("aircraft", "airplane", "plane", "helicopter", "jet")):
+            return "Air"
+        if any(token in normalized for token in ("boat", "ship", "marine")):
+            return "Boats"
+        if any(token in normalized for token in ("scenario", "mission")):
+            return "Scenarios"
+        if any(token in normalized for token in ("terrain", "map", "level")):
+            return "Terrains/Levels/Maps"
+        if any(token in normalized for token in ("userinterface", "ui", "app", "hud")):
+            return "UI Apps"
+        if any(token in normalized for token in ("skin", "livery")):
+            return "Skins"
+        if any(token in normalized for token in ("sound", "audio")):
+            return "Sounds"
+        if any(token in normalized for token in ("config", "configuration")):
+            return "Configurations"
+        if "automation" in normalized:
+            return "Automation"
+        if "trackbuilder" in normalized:
+            return "Track Builder"
+        if any(token in normalized for token in ("car", "truck", "bike", "bus", "van", "vehicle")):
+            return "Vehicles"
+        return ""
+
+    def _extract_category_label_from_type_value(self, root: object) -> str:
+        stack: list[object] = [root]
+        visited: set[int] = set()
+        candidate_keys = {"type", "modtype", "vehicletype"}
+        while stack:
+            current = stack.pop()
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            if isinstance(current, dict):
+                for key, nested in current.items():
+                    normalized_key = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+                    if normalized_key in candidate_keys:
+                        label = self._category_label_from_type_hint(str(nested))
+                        if label:
+                            return label
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+                continue
+            if isinstance(current, list):
+                for nested in current:
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+        return ""
+
+    def _db_mod_data_for_mod(self, mod_path: Path) -> dict[str, object] | None:
+        if self.index is None:
+            return None
+        target = self._all_mod_by_path.get(str(mod_path))
+        if target is None:
+            return None
+        fullpath = mod_db_fullpath(self.index, target).replace("\\", "/").lower()
+        mod_data = self._db_mod_data_by_fullpath.get(fullpath)
+        if isinstance(mod_data, dict):
+            return mod_data
+        return None
+
+    def _repo_category_label_from_db(self, mod_path: Path) -> str:
+        mod_data = self._db_mod_data_for_mod(mod_path)
+        if mod_data is None:
+            return ""
+        label = self._extract_repo_category_label_from_value(mod_data)
+        if label:
+            return label
+        return self._extract_category_label_from_type_value(mod_data)
+
+    def _repo_category_badge_label(self, mod: ModEntry, analysis) -> str:
+        label = self._extract_repo_category_label_from_value(analysis.parsed_data)
+        if label:
+            return label
+        if mod.source == "repo":
+            label = self._repo_category_label_from_db(mod.path)
+            if label:
+                return label
+        summary = analysis.summary_fields if hasattr(analysis, "summary_fields") else None
+        if isinstance(summary, dict):
+            label = self._extract_repo_category_label_from_value(summary)
+            if label:
+                return label
+            info_path_category = str(summary.get("__category", "")).strip().lower()
+            if info_path_category:
+                return _REPO_CATEGORY_LABEL_BY_INFO_PATH.get(info_path_category, "")
+        if mod.source != "repo":
+            label = self._extract_category_label_from_type_value(analysis.parsed_data)
+            if label:
+                return label
+        return ""
+
+    def _display_mod_name_for_table(self, mod_path_raw: str, file_name: str) -> str:
+        if self.info_caption_checkbox.isChecked():
+            info_name = str(self._mod_info_label_by_path.get(str(mod_path_raw), "")).strip()
+            if info_name:
+                return info_name
+        return file_name
 
     def _prefix_badge_stylesheet(self, prefix: str) -> str:
         key = str(prefix).strip().lower()
@@ -2486,6 +2161,18 @@ html[${{attrName}}="1"] svg {{
             f"background: {bg}; "
             f"color: {fg}; "
             f"border: 1px solid {border}; "
+            "border-radius: 3px; "
+            "padding: 1px 4px; "
+            "font-weight: 600; "
+            "}"
+        )
+
+    def _category_badge_stylesheet(self) -> str:
+        return (
+            "QLabel#category_badge_label { "
+            "background: rgba(46, 46, 46, 0.92); "
+            "color: #f0f0f0; "
+            "border: 1px solid #8f8f8f; "
             "border-radius: 3px; "
             "padding: 1px 4px; "
             "font-weight: 600; "
@@ -2523,11 +2210,16 @@ html[${{attrName}}="1"] svg {{
             return f"{primary} - {author}"
         return primary
 
-    def _build_preview_pixmap(self, mod_path: Path, image_size: QSize) -> QPixmap:
+    def _preview_source_pixmap(self, mod_path: Path) -> QPixmap:
         data = self._preview_image_bytes_cached(mod_path)
         source = QPixmap()
         if data:
             source.loadFromData(data)
+        if source.isNull():
+            source = self.missing_preview_pixmap
+        return source
+
+    def _fit_preview_pixmap(self, source: QPixmap, image_size: QSize) -> QPixmap:
         if source.isNull():
             source = self.missing_preview_pixmap
 
@@ -2542,6 +2234,10 @@ html[${{attrName}}="1"] svg {{
         painter.drawPixmap(x, y, fitted)
         painter.end()
         return canvas
+
+    def _build_preview_pixmap(self, mod_path: Path, image_size: QSize) -> QPixmap:
+        source = self._preview_source_pixmap(mod_path)
+        return self._fit_preview_pixmap(source, image_size)
 
     def _build_icon_card_holder(
         self,
@@ -2603,6 +2299,16 @@ html[${{attrName}}="1"] svg {{
         prefix_badge.move(max(6, image_width - prefix_badge.width() - 10), max(6, image_height - prefix_badge.height() - 6))
         prefix_badge.raise_()
 
+        category_badge = QLabel(image_container)
+        category_badge.setObjectName("category_badge_label")
+        category_value = self._mod_category_by_path.get(str(mod.path), "")
+        category_badge.setStyleSheet(self._category_badge_stylesheet())
+        category_badge.setText(category_value)
+        category_badge.setVisible(bool(category_value))
+        category_badge.adjustSize()
+        category_badge.move(max(6, image_width - category_badge.width() - 10), 6)
+        category_badge.raise_()
+
         name_label = ElidedLabel(parent=holder)
         name_label.setObjectName("icon_name_label")
         name_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -2622,6 +2328,7 @@ html[${{attrName}}="1"] svg {{
         mods_list = list(mods)
         self.mods_icons.clear()
         self._icon_holder_by_path = {}
+        self._icon_source_pixmap_by_path = {}
         if not mods_list:
             return
 
@@ -2632,7 +2339,7 @@ html[${{attrName}}="1"] svg {{
         item_bg_name = self.palette().color(self.backgroundRole()).name()
         total = len(mods_list)
         cursor = {"value": 0}
-        self._set_status_line3_progress(f"Loading icon cards... 0/{total}")
+        self._set_background_status_line3_progress(f"Loading icon cards... 0/{total}")
 
         def _populate_batch() -> None:
             if population_token != self._icon_population_token:
@@ -2651,7 +2358,7 @@ html[${{attrName}}="1"] svg {{
                 self.mods_icons.setItemWidget(item, holder)
             cursor["value"] = end
             if end == total or end % 200 == 0:
-                self._set_status_line3_progress(f"Loading icon cards... {end}/{total}")
+                self._set_background_status_line3_progress(f"Loading icon cards... {end}/{total}")
             if end < total:
                 QTimer.singleShot(0, _populate_batch)
                 return
@@ -2666,7 +2373,7 @@ html[${{attrName}}="1"] svg {{
             return
         show_info = self.info_caption_checkbox.isChecked()
         cursor = {"value": 0}
-        self._set_status_line3_progress(f"Loading icon previews... 0/{total}")
+        self._set_background_status_line3_progress(f"Loading icon previews... 0/{total}")
 
         def _details_batch() -> None:
             if detail_token != self._icon_detail_token:
@@ -2679,21 +2386,28 @@ html[${{attrName}}="1"] svg {{
                 if holder is None:
                     continue
                 self._set_icon_prefix_badge_for_mod(mod.path, self._mod_prefix_by_path.get(str(mod.path), ""))
+                self._set_icon_category_badge_for_mod(mod.path, self._mod_category_by_path.get(str(mod.path), ""))
                 image_label = holder.findChild(QLabel, "preview_image_label")
                 if image_label is not None:
                     target_size = QSize(max(1, image_label.width()), max(1, image_label.height()))
-                    image_label.setPixmap(self._build_preview_pixmap(mod.path, target_size))
+                    mod_key = str(mod.path)
+                    source = self._icon_source_pixmap_by_path.get(mod_key)
+                    if source is None or source.isNull():
+                        source = self._preview_source_pixmap(mod.path)
+                        self._icon_source_pixmap_by_path[mod_key] = source
+                    image_label.setPixmap(self._fit_preview_pixmap(source, target_size))
                 if show_info:
                     name_label = holder.findChild(ElidedLabel, "icon_name_label")
                     if name_label is not None:
                         name_label.set_full_text(self._icon_caption(mod))
             cursor["value"] = end
             if end == total or end % 100 == 0:
-                self._set_status_line3_progress(f"Loading icon previews... {end}/{total}")
+                self._set_background_status_line3_progress(f"Loading icon previews... {end}/{total}")
             if end < total:
                 QTimer.singleShot(0, _details_batch)
                 return
-            self._set_status_line3_progress(f"Loading icon previews done ({total}/{total})")
+            self._set_background_status_line3_progress(f"Loading icon previews done ({total}/{total})")
+            self._set_folder_active_total_line3()
 
         _details_batch()
 
@@ -2749,10 +2463,11 @@ html[${{attrName}}="1"] svg {{
         file_menu = self.menuBar().addMenu("File")
         packs_menu = self.menuBar().addMenu("Packs")
         tools_menu = self.menuBar().addMenu("Tools")
+        settings_menu = self.menuBar().addMenu("Settings")
 
         settings_action = QAction("Settings...", self)
         settings_action.triggered.connect(self._open_settings)
-        file_menu.addAction(settings_action)
+        settings_menu.addAction(settings_action)
 
         refresh_action = QAction("Refresh", self)
         refresh_action.triggered.connect(self.full_refresh)
@@ -2779,11 +2494,14 @@ html[${{attrName}}="1"] svg {{
         self.beam_mods_root = beam_mods
         self.library_root = library
         self.db_path = Path(self.beam_mods_root) / "db.json" if self.beam_mods_root else Path()
-        self.online_cache_max_mb, self.online_cache_ttl_hours = load_online_cache_preferences()
-        self.online_cache_max_mb = max(64, min(_WEBENGINE_HTTP_CACHE_MAX_MB, int(self.online_cache_max_mb)))
-        self._update_online_client_roots()
-        if self.online_profile is not None:
-            self.online_profile.setHttpCacheMaximumSize(_webengine_cache_bytes(self.online_cache_max_mb))
+        self.open_in_browser_mode = load_browser_open_mode()
+        self.bridge_debug_enabled = load_bridge_debug_enabled()
+        loaded_bridge_port = load_firefox_bridge_port()
+        if int(loaded_bridge_port) != int(self.firefox_bridge_port):
+            self.firefox_bridge_port = int(loaded_bridge_port)
+            self._restart_firefox_bridge_server()
+        elif self.firefox_bridge_server is not None:
+            self.firefox_bridge_server.set_debug_enabled(bool(self.bridge_debug_enabled))
         if not self._settings_valid():
             self._open_settings(force=True)
             if not self._settings_valid():
@@ -2800,19 +2518,41 @@ html[${{attrName}}="1"] svg {{
 
     def _open_settings(self, force: bool = False) -> None:
         while True:
+            previous_beam_mods_root = str(self.beam_mods_root or "")
+            previous_library_root = str(self.library_root or "")
+            previous_open_mode = str(self.open_in_browser_mode or "")
+            previous_bridge_port = int(self.firefox_bridge_port)
+            previous_bridge_debug = bool(self.bridge_debug_enabled)
             dlg = SettingsDialog(self)
             accepted = dlg.exec()
+            if accepted == 0:
+                return
+
             self.beam_mods_root, self.library_root = load_settings()
             self.db_path = Path(self.beam_mods_root) / "db.json" if self.beam_mods_root else Path()
-            self.online_cache_max_mb, self.online_cache_ttl_hours = load_online_cache_preferences()
-            self.online_cache_max_mb = max(64, min(_WEBENGINE_HTTP_CACHE_MAX_MB, int(self.online_cache_max_mb)))
-            self._update_online_client_roots()
-            if self.online_profile is not None:
-                self.online_profile.setHttpCacheMaximumSize(_webengine_cache_bytes(self.online_cache_max_mb))
+            self.open_in_browser_mode = load_browser_open_mode()
+            self.bridge_debug_enabled = load_bridge_debug_enabled()
+            loaded_bridge_port = load_firefox_bridge_port()
+            if int(loaded_bridge_port) != int(self.firefox_bridge_port):
+                self.firefox_bridge_port = int(loaded_bridge_port)
+                self._restart_firefox_bridge_server()
+            elif self.firefox_bridge_server is not None:
+                self.firefox_bridge_server.set_debug_enabled(bool(self.bridge_debug_enabled))
+
             if self._settings_valid():
-                self._refresh_now_or_when_shown()
+                paths_changed = (
+                    str(self.beam_mods_root or "") != previous_beam_mods_root
+                    or str(self.library_root or "") != previous_library_root
+                )
+                mode_changed = str(self.open_in_browser_mode or "") != previous_open_mode
+                port_changed = int(self.firefox_bridge_port) != previous_bridge_port
+                debug_changed = bool(self.bridge_debug_enabled) != previous_bridge_debug
+                if paths_changed:
+                    self._refresh_now_or_when_shown()
+                elif mode_changed or port_changed or debug_changed:
+                    self._set_status_line3("Settings saved.")
                 return
-            if not force or accepted == 0:
+            if not force:
                 break
             self._show_silent_warning("Settings Required", "Both folders must be configured before scanning.")
 
@@ -2825,8 +2565,9 @@ html[${{attrName}}="1"] svg {{
 
     def _install_interaction_filters(self) -> None:
         widgets: list[QWidget] = []
-        if hasattr(self, "main_tabs") and isinstance(self.main_tabs, QWidget):
-            widgets.append(self.main_tabs)
+        center = self.centralWidget()
+        if isinstance(center, QWidget):
+            widgets.append(center)
         menu = self.menuBar()
         if menu is not None:
             widgets.append(menu)
@@ -2990,6 +2731,7 @@ html[${{attrName}}="1"] svg {{
         self._load_active_states_from_db(show_progress=True)
         self._set_status_line3_progress("Refreshing pack and mod lists...")
         self._rebuild_known_mod_names()
+        self._sync_mod_info_cache_with_index()
         self._rebuild_left_tree()
         self._ensure_profiles_initialized()
         self._refresh_profile_combo()
@@ -3016,6 +2758,7 @@ html[${{attrName}}="1"] svg {{
             self._cancel_mod_population_jobs()
             self._mod_row_by_path = {}
             self._icon_holder_by_path = {}
+            self._icon_source_pixmap_by_path = {}
             self.mods_table.clearContents()
             self.mods_table.setRowCount(0)
             self.mods_icons.clear()
@@ -3023,6 +2766,7 @@ html[${{attrName}}="1"] svg {{
             self._update_summary_status()
         if not self._left_splitter_initialized and not self._left_splitter_user_resized:
             self._apply_initial_left_pane_width()
+        self._save_mod_info_cache()
         if context:
             self._set_status_line3(f"{context} done")
 
@@ -3035,6 +2779,21 @@ html[${{attrName}}="1"] svg {{
         for pack_mods in self.index.pack_mods.values():
             mods.extend(pack_mods)
         return mods
+
+    def _active_total_for_mods(self, mods: list[ModEntry]) -> tuple[int, int]:
+        total = len(mods)
+        if total <= 0:
+            return 0, 0
+        active = sum(1 for mod in mods if self._mod_active(mod))
+        return active, total
+
+    def _set_folder_active_total_line3(self) -> None:
+        items = self.left_tree.selectedItems()
+        if not items:
+            return
+        mods = self._mods_for_left_item(items[0])
+        active, total = self._active_total_for_mods(mods)
+        self._set_status_line3(f"Active mods in selection: {active}/{total}")
 
     def _is_repo_mod_path(self, mod_path: Path) -> bool:
         if not self.beam_mods_root:
@@ -3056,12 +2815,26 @@ html[${{attrName}}="1"] svg {{
             self._set_status_line3_progress("Loading and analyzing db.json...")
         if self.index is None or not self.db_path:
             self.active_by_db_fullpath = {}
+            self._db_mod_data_by_fullpath = {}
             if show_progress:
                 self._set_status_line3_progress("No db.json found. Using in-memory active states.")
             return
         previous_map = dict(self.active_by_db_fullpath)
         payload = load_beam_db(self.db_path)
         active_map = extract_active_by_db_fullpath(payload)
+        mod_data_by_fullpath: dict[str, dict[str, object]] = {}
+        mods_payload = payload.get("mods", {})
+        if isinstance(mods_payload, dict):
+            for value in mods_payload.values():
+                if not isinstance(value, dict):
+                    continue
+                fullpath = str(value.get("fullpath") or "").strip().replace("\\", "/").lower()
+                if not fullpath:
+                    continue
+                mod_data = value.get("modData")
+                if isinstance(mod_data, dict):
+                    mod_data_by_fullpath[fullpath] = mod_data
+        self._db_mod_data_by_fullpath = mod_data_by_fullpath
         all_mods = self._all_scanned_mod_entries()
         total_mods = len(all_mods)
         started_at = time.monotonic()
@@ -3200,6 +2973,26 @@ html[${{attrName}}="1"] svg {{
         badge.adjustSize()
         x = max(6, image_label.width() - badge.width() - 6)
         y = max(6, image_label.height() - badge.height() - 6)
+        badge.move(x, y)
+        badge.raise_()
+
+    def _set_icon_category_badge_for_mod(self, mod_path: Path, category: str) -> None:
+        holder = self._icon_holder_by_path.get(str(mod_path))
+        if holder is None:
+            return
+        badge = holder.findChild(QLabel, "category_badge_label")
+        image_label = holder.findChild(QLabel, "preview_image_label")
+        if badge is None or image_label is None:
+            return
+        text = str(category).strip()
+        badge.setStyleSheet(self._category_badge_stylesheet())
+        badge.setText(text)
+        badge.setVisible(bool(text))
+        if not text:
+            return
+        badge.adjustSize()
+        x = max(6, image_label.width() - badge.width() - 6)
+        y = 6
         badge.move(x, y)
         badge.raise_()
 
@@ -3539,6 +3332,7 @@ html[${{attrName}}="1"] svg {{
             self._set_status_line3("Load profile cancelled.")
             return
         self._flush_db_write_if_pending(show_progress=True)
+        self._profile_load_in_progress = True
         self._lock_interaction("Profile loading is in progress.")
         try:
             self._set_status_line3_progress(f"Loading profile '{path.stem}'...")
@@ -3736,6 +3530,7 @@ html[${{attrName}}="1"] svg {{
                     self._lock_interaction("Profile loading is in progress.")
             self._set_status_line3(f"Loaded profile: {path.stem}")
         finally:
+            self._profile_load_in_progress = False
             self._unlock_interaction()
 
     def _effective_profile_states_and_conflicts(
@@ -3881,6 +3676,7 @@ html[${{attrName}}="1"] svg {{
             self._cancel_mod_population_jobs()
             self._mod_row_by_path = {}
             self._icon_holder_by_path = {}
+            self._icon_source_pixmap_by_path = {}
             self.mods_table.clearContents()
             self.mods_table.setRowCount(0)
             self.mods_icons.clear()
@@ -3893,7 +3689,7 @@ html[${{attrName}}="1"] svg {{
         left_item = items[0]
         self._save_last_left_selection(left_item)
         mods = self._mods_for_left_item(left_item)
-        self.current_mod_entries = sorted(mods, key=lambda m: m.path.name.lower())
+        self.current_mod_entries = self._sorted_mod_entries(mods)
         self._status_for_folder(left_item, len(mods))
         self._repopulate_current_mod_view()
 
@@ -3912,9 +3708,10 @@ html[${{attrName}}="1"] svg {{
         finally:
             self._updating_mod_table = False
         if total <= 0:
+            self._set_folder_active_total_line3()
             return
         cursor = {"value": 0}
-        self._set_status_line3_progress(f"Loading mod list... 0/{total}")
+        self._set_background_status_line3_progress(f"Loading mod list... 0/{total}")
 
         def _populate_batch() -> None:
             if table_token != self._table_population_token:
@@ -3928,17 +3725,17 @@ html[${{attrName}}="1"] svg {{
                     mod = mods_list[row]
                     mod_path_raw = str(mod.path)
                     self._mod_row_by_path[mod_path_raw] = row
-                    prefix = self._mod_prefix_by_path.get(mod_path_raw, "")
-                    name_cell = QTableWidgetItem(self._format_mod_name_with_prefix(mod.path.name, prefix))
+                    prefix = str(self._mod_prefix_by_path.get(mod_path_raw, "")).strip()
+                    category = str(self._mod_category_by_path.get(mod_path_raw, "")).strip()
+                    name_text = self._display_mod_name_for_table(mod_path_raw, mod.path.name)
+                    name_cell = QTableWidgetItem(name_text)
                     name_cell.setFlags(name_cell.flags() | Qt.ItemIsUserCheckable)
                     name_cell.setCheckState(Qt.Checked if self._mod_active(mod) else Qt.Unchecked)
-                    update_cell = QTableWidgetItem("")
-                    update_cell.setTextAlignment(int(Qt.AlignCenter | Qt.AlignVCenter))
                     row_items = [
                         name_cell,
-                        update_cell,
+                        QTableWidgetItem(prefix),
+                        QTableWidgetItem(category),
                         QTableWidgetItem(human_size(mod.size)),
-                        QTableWidgetItem("..."),
                     ]
                     for col, cell in enumerate(row_items):
                         cell.setData(RIGHT_PATH_ROLE, mod_path_raw)
@@ -3947,7 +3744,7 @@ html[${{attrName}}="1"] svg {{
                 self._updating_mod_table = False
             cursor["value"] = end
             if end == total or end % 250 == 0:
-                self._set_status_line3_progress(f"Loading mod list... {end}/{total}")
+                self._set_background_status_line3_progress(f"Loading mod list... {end}/{total}")
             if end < total:
                 QTimer.singleShot(0, _populate_batch)
                 return
@@ -3960,18 +3757,18 @@ html[${{attrName}}="1"] svg {{
         total = len(mods)
         if total <= 0:
             return
-        self._set_status_line3_progress(f"Inspecting info.json presence... 0/{total}")
+        self._set_background_status_line3_progress(f"Loading mod metadata... 0/{total}")
 
         def _worker_fn(progress_emit):
-            batch: list[tuple[str, str, str, int, int]] = []
+            batch: list[tuple[str, str, str, str, int, int]] = []
             for idx, mod in enumerate(mods, start=1):
                 if info_token != self._table_info_token or table_token != self._table_population_token:
                     return total
-                state = "Yes" if has_info_json(mod.path) else "No"
-                prefix = ""
-                if state == "Yes":
-                    prefix = self._extract_prefix_value(parse_mod_info(mod.path))
-                batch.append((str(mod.path), state, prefix, idx, total))
+                analysis = get_info_json_analysis_cached(mod.path, self.mod_info_cache)
+                prefix = self._extract_prefix_value(analysis.summary_fields)
+                category = self._repo_category_badge_label(mod, analysis)
+                info_label = self._sort_info_label_for_analysis(analysis, mod.path.name)
+                batch.append((str(mod.path), prefix, category, info_label, idx, total))
                 if len(batch) >= _TABLE_INFO_BATCH_SIZE:
                     progress_emit(batch)
                     batch = []
@@ -3997,35 +3794,43 @@ html[${{attrName}}="1"] svg {{
         self._updating_mod_table = True
         try:
             for item in payload:
-                if not isinstance(item, tuple) or len(item) != 5:
+                if not isinstance(item, tuple) or len(item) != 6:
                     continue
-                path_raw, state, prefix, idx, total_count = item
+                path_raw, prefix, category, info_label, idx, total_count = item
                 row = self._mod_row_by_path.get(str(path_raw))
                 if row is None or row >= self.mods_table.rowCount():
                     continue
                 mod_path = Path(str(path_raw))
                 prefix_text = str(prefix).strip()
+                category_text = str(category).strip()
                 self._mod_prefix_by_path[str(path_raw)] = prefix_text
-                info_cell = self.mods_table.item(row, 3)
-                if info_cell is None:
-                    continue
-                info_cell.setText(str(state))
+                self._mod_category_by_path[str(path_raw)] = category_text
+                self._mod_info_label_by_path[str(path_raw)] = str(info_label).strip()
+                tags_cell = self.mods_table.item(row, 1)
+                if tags_cell is not None:
+                    tags_cell.setText(prefix_text)
+                category_cell = self.mods_table.item(row, 2)
+                if category_cell is not None:
+                    category_cell.setText(category_text)
                 name_cell = self.mods_table.item(row, 0)
                 if name_cell is not None:
-                    name_cell.setText(self._format_mod_name_with_prefix(mod_path.name, prefix_text))
+                    name_cell.setText(self._display_mod_name_for_table(str(path_raw), mod_path.name))
                 self._set_icon_prefix_badge_for_mod(mod_path, prefix_text)
+                self._set_icon_category_badge_for_mod(mod_path, category_text)
                 last_index = max(last_index, int(idx))
                 total = max(total, int(total_count))
         finally:
             self._updating_mod_table = False
         if last_index > 0 and total > 0 and (last_index == total or last_index % 200 == 0):
-            self._set_status_line3_progress(f"Inspecting info.json presence... {last_index}/{total}")
+            self._set_background_status_line3_progress(f"Loading mod metadata... {last_index}/{total}")
 
     def _on_info_json_probe_done(self, table_token: int, info_token: int) -> None:
         if table_token != self._table_population_token or info_token != self._table_info_token:
             return
         total = len(self._mod_row_by_path)
-        self._set_status_line3_progress(f"Inspecting info.json presence done ({total}/{total})")
+        self._set_background_status_line3_progress(f"Loading mod metadata done ({total}/{total})")
+        if not self._is_icon_view_active():
+            self._set_folder_active_total_line3()
 
     def _on_info_json_probe_error(self, table_token: int, info_token: int, error_text: str) -> None:
         if table_token != self._table_population_token or info_token != self._table_info_token:
@@ -4092,12 +3897,12 @@ html[${{attrName}}="1"] svg {{
         line1 = f"Mod: {path.name}  Size: {human_size(size)}  |  Path: {path}"
         self._set_status(line1, "Loading info.json...", "")
 
-        worker = FnWorker(lambda: get_mod_info_cached(path, self.mod_info_cache))
-        worker.signals.done.connect(lambda data, p=path: self._on_mod_info_ready(p, data))
+        worker = FnWorker(lambda: get_info_json_analysis_cached(path, self.mod_info_cache))
+        worker.signals.done.connect(lambda analysis, p=path: self._on_mod_info_ready(p, analysis))
         worker.signals.error.connect(lambda e: self._set_status(line1, f"info.json parse error: {e}", ""))
         self._start_worker(worker)
 
-    def _on_mod_info_ready(self, mod_path: Path, data: dict[str, str] | None) -> None:
+    def _on_mod_info_ready(self, mod_path: Path, analysis) -> None:
         if self.current_mod_path != mod_path:
             return
 
@@ -4107,8 +3912,15 @@ html[${{attrName}}="1"] svg {{
             size = 0
 
         line1 = f"Mod: {mod_path.name}  Size: {human_size(size)}  |  Path: {mod_path}"
-        if data is None:
+        if not analysis.exists:
             self._set_status(line1, "info.json not found", "")
+            return
+        data = analysis.summary_fields
+        if not data:
+            if analysis.status == "invalid":
+                self._set_status(line1, "info.json invalid", str(analysis.error_text or "Unable to parse info.json"))
+                return
+            self._set_status(line1, "info.json found", "")
             return
 
         category = data.get("__category", "other")
@@ -4157,15 +3969,13 @@ html[${{attrName}}="1"] svg {{
             return
 
         t = self.index.totals
-        line1 = f"Active mods: {t.active_mods} / Total mods: {t.total_mods}"
+        active_mods, _total_scanned = self._active_total_for_mods(self._all_scanned_mod_entries())
+        line1 = f"Active mods: {active_mods} / Total mods: {t.total_mods}"
         line2 = f"Packs active: {t.packs_active}/{t.packs_total} | Loose: {t.loose_mods} | Repo: {t.repo_mods}"
         self._set_status(line1, line2, self.status_line3_message)
 
     def _set_status(self, line1: str, line2: str, line3: str) -> None:
         self._local_status_lines = (line1, line2, line3)
-        if self._is_online_tab_active():
-            self._set_online_status()
-            return
         self._render_status(line1, line2, line3)
 
     def _update_status_box_height(self, *_args) -> None:
@@ -4186,21 +3996,29 @@ html[${{attrName}}="1"] svg {{
 
     def _set_status_line3_progress(self, message: str) -> None:
         self.status_line3_message = message
-        if self._is_online_tab_active():
-            self._set_online_status()
-        else:
-            line1, line2, _line3 = self._local_status_lines
-            self._render_status(line1, line2, message)
+        line1, line2, _line3 = self._local_status_lines
+        self._render_status(line1, line2, message)
         QApplication.processEvents(
             QEventLoop.AllEvents,
             50,
         )
+
+    def _set_background_status_line3_progress(self, message: str) -> None:
+        if self._profile_load_in_progress:
+            return
+        self._set_status_line3_progress(message)
 
     def _on_confirm_actions_toggled(self, checked: bool) -> None:
         self.confirm_actions_enabled = bool(checked)
         self.settings_store.setValue("confirm_actions_enabled", self.confirm_actions_enabled)
         state = "enabled" if self.confirm_actions_enabled else "disabled"
         self._set_status_line3(f"Action confirmations {state}.")
+
+    def _on_download_watch_toggled(self, checked: bool) -> None:
+        self.download_watch_enabled = bool(checked)
+        self.settings_store.setValue("download_watch_enabled", self.download_watch_enabled)
+        state = "enabled" if self.download_watch_enabled else "disabled"
+        self._set_status_line3(f"Download Watch {state}.")
 
     def _confirm_action(self, title: str, question: str, default_yes: bool = True) -> bool:
         if not self.confirm_actions_enabled:
@@ -4279,7 +4097,7 @@ html[${{attrName}}="1"] svg {{
             self._show_silent_information("Duplicates", "No scan data available yet.")
             return
         self._set_status_line3_progress("Analyzing duplicates...")
-        dlg = DuplicatesDialog(self.index, self)
+        dlg = DuplicatesDialog(self.index, self, delete_selected_cb=self._delete_mods_from_duplicates)
         dlg.exec()
         self._set_status_line3("Duplicate analysis closed.")
 
@@ -4370,6 +4188,148 @@ html[${{attrName}}="1"] svg {{
                 paths.append(Path(value))
         return paths
 
+    def _resource_url_from_token(self, token: str) -> str | None:
+        value = str(token or "").strip()
+        if not value:
+            return None
+        if value.startswith("https://") or value.startswith("http://"):
+            return value
+        return f"https://www.beamng.com/resources/{value}/"
+
+    def _extract_resource_url_from_text(self, text: str | None) -> str | None:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        match = re.search(r"https?://(?:www\.)?beamng\.com/resources/[^\s\"'<>]+", value, flags=re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(0).rstrip(").,;")
+
+    def _resource_token_from_info_json_value(self, root: object) -> str | None:
+        stack: list[object] = [root]
+        visited: set[int] = set()
+        while stack:
+            current = stack.pop()
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            if isinstance(current, dict):
+                token = str(current.get("resource_id") or current.get("resourceId") or "").strip()
+                if token:
+                    return token
+                for nested in current.values():
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+                continue
+            if isinstance(current, list):
+                for nested in current:
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+        return None
+
+    def _resource_url_from_info_json_value(self, root: object) -> str | None:
+        stack: list[object] = [root]
+        visited: set[int] = set()
+        while stack:
+            current = stack.pop()
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            if isinstance(current, dict):
+                for nested in current.values():
+                    if isinstance(nested, str):
+                        url = self._extract_resource_url_from_text(nested)
+                        if url:
+                            return url
+                    elif isinstance(nested, (dict, list)):
+                        stack.append(nested)
+                continue
+            if isinstance(current, list):
+                for nested in current:
+                    if isinstance(nested, str):
+                        url = self._extract_resource_url_from_text(nested)
+                        if url:
+                            return url
+                    elif isinstance(nested, (dict, list)):
+                        stack.append(nested)
+        return None
+
+    def _resource_token_from_db(self, mod_path: Path) -> str | None:
+        mod_data = self._db_mod_data_for_mod(mod_path)
+        if not isinstance(mod_data, dict):
+            return None
+        token = str(mod_data.get("resource_id") or mod_data.get("resourceId") or "").strip()
+        return token or None
+
+    def _resource_url_from_db(self, mod_path: Path) -> str | None:
+        mod_data = self._db_mod_data_for_mod(mod_path)
+        if isinstance(mod_data, dict):
+            for key in ("url", "resource_url", "resourceUrl", "link", "download_url", "downloadUrl"):
+                raw = mod_data.get(key)
+                if isinstance(raw, str):
+                    url = self._extract_resource_url_from_text(raw)
+                    if url:
+                        return url
+        return None
+
+    def _resource_url_for_repo_mod(self, mod_path: Path) -> str | None:
+        analysis = get_info_json_analysis_cached(mod_path, self.mod_info_cache)
+        token_from_info = self._resource_token_from_info_json_value(analysis.parsed_data)
+        url_from_info = self._resource_url_from_token(token_from_info or "")
+        if url_from_info:
+            return url_from_info
+        direct_url_from_info = self._resource_url_from_info_json_value(analysis.parsed_data)
+        if direct_url_from_info:
+            return direct_url_from_info
+        raw_url_from_info = self._extract_resource_url_from_text(analysis.raw_text)
+        if raw_url_from_info:
+            return raw_url_from_info
+        direct_url_from_db = self._resource_url_from_db(mod_path)
+        if direct_url_from_db:
+            return direct_url_from_db
+        token_from_db = self._resource_token_from_db(mod_path)
+        return self._resource_url_from_token(token_from_db or "")
+
+    def _open_repo_mod_in_browser(self, mod_path: Path) -> None:
+        if not self._is_repo_mod_path(mod_path):
+            self._set_status_line3("Open in browser is only available for repo mods.")
+            return
+        resource_url = self._resource_url_for_repo_mod(mod_path)
+        if not resource_url:
+            self._set_status_line3(f"Cannot resolve BeamNG resource URL for {mod_path.name}.")
+            return
+        mode = str(self.open_in_browser_mode or "bridge").strip().lower()
+        if mode == "default":
+            opened = QDesktopServices.openUrl(QUrl(resource_url))
+            if opened:
+                self._set_status_line3(f"Opened in default browser: {resource_url}")
+            else:
+                self._set_status_line3(f"Could not open URL in default browser: {resource_url}")
+            return
+        server = self.firefox_bridge_server
+        if server is None:
+            self._start_firefox_bridge_server()
+            server = self.firefox_bridge_server
+            if server is None:
+                self._set_status_line3(
+                    f"Browser bridge is not running on configured port {self.firefox_bridge_port}."
+                )
+                return
+        ok, message = server.queue_open_url(resource_url)
+        if not ok:
+            self._restart_firefox_bridge_server()
+            server = self.firefox_bridge_server
+            if server is not None:
+                ok, message = server.queue_open_url(resource_url)
+        if ok:
+            self._set_status_line3(
+                f"{message} Port={self.firefox_bridge_port} URL={resource_url}"
+            )
+            return
+        self._set_status_line3(f"Open in browser failed: {message}")
+
     def _open_mod_externally(self, mod_path: Path) -> None:
         try:
             if os.name == "nt":
@@ -4388,6 +4348,26 @@ html[${{attrName}}="1"] svg {{
     def _on_mod_icon_double_clicked(self, item: QListWidgetItem) -> None:
         mod_path = Path(str(item.data(RIGHT_PATH_ROLE)))
         self._open_mod_externally(mod_path)
+
+    def _open_info_json_viewer(self, mod_path: Path) -> None:
+        worker = FnWorker(lambda: get_info_json_analysis_cached(mod_path, self.mod_info_cache))
+        worker.signals.done.connect(lambda analysis, p=mod_path: self._on_info_json_viewer_ready(p, analysis))
+        worker.signals.error.connect(lambda e, p=mod_path: self._set_status_line3(f"Metadata load error for {p.name}: {e}"))
+        self._start_worker(worker)
+
+    def _on_info_json_viewer_ready(self, mod_path: Path, analysis) -> None:
+        dialog = InfoJsonViewerDialog(mod_path.name, mod_path, analysis, self)
+        self._info_json_viewers.append(dialog)
+        dialog.destroyed.connect(lambda *_args, dlg=dialog: self._drop_info_json_viewer_ref(dlg))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _drop_info_json_viewer_ref(self, dialog: InfoJsonViewerDialog) -> None:
+        try:
+            self._info_json_viewers.remove(dialog)
+        except ValueError:
+            return
 
     def _show_mod_context_menu(self, pos) -> None:
         if self.index is None:
@@ -4416,8 +4396,15 @@ html[${{attrName}}="1"] svg {{
         if not mod_paths:
             return
 
+        single_selection = len(mod_paths) == 1
+        repo_single_selection = single_selection and self._is_repo_mod_path(mod_paths[0])
+
         menu = QMenu(self)
         open_external_action = menu.addAction("Open externally")
+        open_browser_action = menu.addAction("Open in browser")
+        open_browser_action.setEnabled(repo_single_selection)
+        view_metadata_action = menu.addAction("View Metadata")
+        view_metadata_action.setEnabled(single_selection)
         recheck_image_action = menu.addAction("Recheck images in zip")
         menu.addSeparator()
         enable_selected_action = menu.addAction("Enable selected")
@@ -4425,14 +4412,21 @@ html[${{attrName}}="1"] svg {{
         menu.addSeparator()
         move_to_pack_action = None
         move_to_root_action = None
+        delete_mods_action = None
         if left_kind in {"mods_root", "pack"}:
             move_to_pack_action = menu.addAction("Move to pack...")
             move_to_root_action = menu.addAction("Move to Mods root")
             move_to_root_action.setEnabled(left_kind == "pack")
+            menu.addSeparator()
+            delete_mods_action = menu.addAction("Delete selected mod(s)")
 
         chosen = menu.exec(global_pos)
         if chosen == open_external_action:
             self._open_mod_externally(mod_paths[0])
+        elif chosen == open_browser_action and repo_single_selection:
+            self._open_repo_mod_in_browser(mod_paths[0])
+        elif chosen == view_metadata_action and single_selection:
+            self._open_info_json_viewer(mod_paths[0])
         elif chosen == recheck_image_action:
             self._recheck_mod_images(mod_paths)
         elif chosen == enable_selected_action:
@@ -4444,6 +4438,50 @@ html[${{attrName}}="1"] svg {{
             self._move_selected_mod_to_pack(mod_paths, source_pack)
         elif move_to_root_action is not None and chosen == move_to_root_action:
             self._move_mods_to_root(mod_paths)
+        elif delete_mods_action is not None and chosen == delete_mods_action:
+            self._delete_mod_files(mod_paths)
+
+    def _delete_mod_files(self, mod_paths: list[Path]) -> bool:
+        if not mod_paths:
+            self._set_status_line3("No selected mods to delete.")
+            return False
+        if self._beamng_mutation_blocked("delete mods", show_dialog=True):
+            return False
+        if any(self._is_repo_mod_path(mod_path) for mod_path in mod_paths):
+            self._set_status_line3("Deleting mods in the repo folder is disabled.")
+            return False
+        if not self._confirm_action(
+            "Delete Mods",
+            f"Delete {len(mod_paths)} selected mod(s)?\nThis cannot be undone.",
+            default_yes=False,
+        ):
+            self._set_status_line3("Delete mods cancelled.")
+            return False
+
+        deleted = 0
+        failed: list[str] = []
+        total = len(mod_paths)
+        self._set_status_line3_progress(f"Deleting selected mods... 0/{total}")
+        for index, mod_path in enumerate(mod_paths, start=1):
+            done, msg = delete_mod_file(mod_path)
+            if done:
+                deleted += 1
+            else:
+                failed.append(msg)
+            if index == total or index % 10 == 0:
+                self._set_status_line3_progress(f"Deleting selected mods... {index}/{total}")
+
+        if deleted > 0:
+            self.full_refresh()
+
+        if failed:
+            self._set_status_line3(f"Deleted: {deleted}/{total} | Errors: {len(failed)} | {failed[0]}")
+        else:
+            self._set_status_line3(f"Deleted {deleted}/{total} mod(s).")
+        return deleted > 0
+
+    def _delete_mods_from_duplicates(self, mod_paths: list[Path]) -> bool:
+        return self._delete_mod_files(mod_paths)
 
     def _move_selected_mod_to_pack(self, mod_paths: list[Path], source_pack: str | None = None) -> None:
         if self.index is None:
@@ -4532,150 +4570,3 @@ html[${{attrName}}="1"] svg {{
             return
         self._move_mods_to_pack(mod_paths, target_name)
 
-    # ------------------------
-    # Online actions and hooks
-    # ------------------------
-    def _online_mutation_blocked(self) -> bool:
-        return self._beamng_mutation_blocked("mutate online mods", show_dialog=True)
-
-    def _start_online_task(self, busy_message: str, fn, done_handler, online_line2: str | None = None) -> None:
-        if self.online_client is not None:
-            self.online_client.clear_cancel_request()
-        self._set_status_line3_progress(busy_message)
-        if self.online_debug_enabled:
-            self._emit_online_console_log(f"TASK start: {busy_message}")
-        if online_line2 is not None:
-            self._set_online_status_line2(online_line2)
-        worker = FnWorker(fn)
-
-        def _on_done(result) -> None:
-            if online_line2 is not None:
-                self._set_online_status_line2("")
-            if self.online_debug_enabled:
-                if isinstance(result, list):
-                    summary = f"list(len={len(result)})"
-                elif isinstance(result, tuple):
-                    summary = f"tuple(len={len(result)})"
-                elif hasattr(result, "ok"):
-                    summary = f"ok={getattr(result, 'ok')}"
-                else:
-                    summary = type(result).__name__
-                self._emit_online_console_log(f"TASK done: {busy_message} result={summary}")
-            done_handler(result)
-
-        def _on_error(error_text: str) -> None:
-            if online_line2 is not None:
-                self._set_online_status_line2("")
-            if self.online_debug_enabled:
-                self._emit_online_console_log(f"TASK error: {busy_message} error={error_text}")
-            self._set_status_line3(f"Online action failed: {error_text}")
-
-        worker.signals.done.connect(_on_done)
-        worker.signals.error.connect(_on_error)
-        self._start_worker(worker)
-
-    def _current_online_url(self) -> str:
-        if self.online_view is None:
-            return ""
-        return self.online_view.url().toString()
-
-    def _handle_online_navigation(self, url: QUrl, _nav_type, _is_main_frame: bool) -> bool:
-        if self.online_client is None:
-            return False
-        url_text = url.toString().strip()
-        if not url_text:
-            return False
-        if self.online_debug_enabled:
-            self._emit_online_console_log(f"WEBVIEW request: {url_text}")
-
-        parsed_protocol = parse_beamng_protocol_uri(url_text)
-        if parsed_protocol:
-            command, _mod_id = parsed_protocol
-            if self.online_debug_enabled:
-                self._emit_online_console_log(f"WEBVIEW protocol forwarded: command={command}")
-            opened = QDesktopServices.openUrl(url)
-            if opened:
-                self._set_status_line3("Forwarded beamng:v1 link to BeamNG.")
-            else:
-                self._set_status_line3("Could not forward beamng:v1 link to BeamNG.")
-            return True
-
-        if is_beamng_resource_download_url(url_text):
-            if self.online_debug_enabled:
-                self._emit_online_console_log(f"WEBVIEW download intercept: {url_text}")
-            if self._online_mutation_blocked():
-                return True
-            destination = self._choose_online_download_destination()
-            if destination is None:
-                self._set_status_line3("Download cancelled.")
-                return True
-            destination_label, destination_path = destination
-
-            def _download() -> object:
-                assert self.online_client is not None
-                return self.online_client.direct_download(url_text, destination_path, overwrite=False)
-
-            self._start_online_task(
-                f"Downloading to {destination_label}...",
-                _download,
-                lambda result: self._on_online_direct_download_done(result, destination_label, destination_path, url_text),
-            )
-            return True
-
-        return False
-
-    def _available_packs_for_download(self) -> list[str]:
-        if self.index is not None:
-            return sorted(self.index.packs, key=str.lower)
-        library_root = Path(self.library_root)
-        if not library_root.exists() or not library_root.is_dir():
-            return []
-        return sorted([p.name for p in library_root.iterdir() if p.is_dir()], key=str.lower)
-
-    def _choose_online_download_destination(self) -> tuple[str, Path] | None:
-        if not self._settings_valid():
-            self._set_status_line3("Configure settings before online downloads.")
-            return None
-        mods_root = Path(self.beam_mods_root)
-        choices: list[tuple[str, Path]] = [
-            ("Mods folder", mods_root),
-        ]
-        for pack in self._available_packs_for_download():
-            choices.append((f"Pack: {pack}", Path(self.library_root) / pack))
-
-        labels = [label for label, _ in choices]
-        selected, ok = QInputDialog.getItem(self, "Download Destination", "Choose destination:", labels, 0, False)
-        if not ok or not selected:
-            return None
-        for label, path in choices:
-            if label == selected:
-                return label, path
-        return None
-
-    def _on_online_direct_download_done(self, result, destination_label: str, destination_path: Path, original_url: str) -> None:
-        if not hasattr(result, "ok"):
-            self._set_status_line3("Unexpected download response.")
-            return
-        if result.ok:
-            self._set_status_line3(f"Downloaded to {destination_label}: {result.file_name}")
-            self.full_refresh()
-            return
-        if isinstance(result.message, str) and "Destination already exists" in result.message:
-            if self._confirm_action(
-                "File Exists",
-                f"{result.file_name} already exists in {destination_label}.\nReplace it?",
-            ):
-
-                def _download_overwrite() -> object:
-                    assert self.online_client is not None
-                    return self.online_client.direct_download(original_url, destination_path, overwrite=True)
-
-                self._start_online_task(
-                    f"Replacing {result.file_name} in {destination_label}...",
-                    _download_overwrite,
-                    lambda retry: self._on_online_direct_download_done(retry, destination_label, destination_path, original_url),
-                )
-                return
-            self._set_status_line3("Replace download cancelled.")
-            return
-        self._set_status_line3(result.message)

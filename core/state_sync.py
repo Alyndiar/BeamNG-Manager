@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.cache import ModEntry, ScanIndex
-from core.modinfo import parse_mod_info_raw
+from core.modinfo import get_info_json_analysis_cached
 
 _DB_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
-_MODDATA_CACHE: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
 
 
 def _default_db_payload() -> dict[str, Any]:
@@ -35,20 +34,10 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cached_repo_mod_data(mod_path: Path) -> dict[str, Any] | None:
-    key = str(mod_path.resolve())
-    try:
-        st = mod_path.stat()
-        sig = (int(st.st_mtime_ns), int(st.st_size))
-    except OSError:
-        sig = (-1, -1)
-    cached = _MODDATA_CACHE.get(key)
-    if cached is not None:
-        cached_mtime, cached_size, cached_data = cached
-        if (cached_mtime, cached_size) == sig:
-            return copy.deepcopy(cached_data) if isinstance(cached_data, dict) else None
-    parsed = parse_mod_info_raw(mod_path)
-    _MODDATA_CACHE[key] = (sig[0], sig[1], copy.deepcopy(parsed) if isinstance(parsed, dict) else None)
-    return parsed
+    analysis = get_info_json_analysis_cached(mod_path)
+    if isinstance(analysis.parsed_data, dict):
+        return copy.deepcopy(analysis.parsed_data)
+    return None
 
 
 def load_beam_db(db_path: Path) -> dict[str, Any]:

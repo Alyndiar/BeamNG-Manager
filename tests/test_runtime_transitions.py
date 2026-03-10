@@ -7,18 +7,10 @@ pytest.importorskip("PySide6")
 from ui.main_window import MainWindow
 
 
-def test_runtime_transition_to_running_relinquishes_and_cancels() -> None:
-    class FakeOnlineClient:
-        def __init__(self) -> None:
-            self.cancelled = False
-
-        def request_cancel(self) -> None:
-            self.cancelled = True
-
+def test_runtime_transition_to_running_relinquishes_without_refresh() -> None:
     class DummyWindow:
         def __init__(self) -> None:
             self._beamng_running = False
-            self.online_client = FakeOnlineClient()
             self.messages: list[str] = []
             self.refresh_count = 0
 
@@ -34,7 +26,6 @@ def test_runtime_transition_to_running_relinquishes_and_cancels() -> None:
     window = DummyWindow()
     MainWindow._on_beamng_runtime_state_changed(window, True)  # type: ignore[arg-type]
     assert window._beamng_running is True
-    assert window.online_client.cancelled is True
     assert window.refresh_count == 0
 
 
@@ -42,7 +33,6 @@ def test_runtime_transition_to_stopped_reclaims_and_refreshes() -> None:
     class DummyWindow:
         def __init__(self) -> None:
             self._beamng_running = True
-            self.online_client = None
             self.messages: list[str] = []
             self.refresh_count = 0
 

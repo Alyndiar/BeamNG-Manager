@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>BeamNG-Manager Bridge Options</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 24px;
+        max-width: 520px;
+      }
+      .row {
+        margin-bottom: 12px;
+      }
+      input {
+        width: 120px;
+        padding: 4px 6px;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      #status {
+        margin-top: 8px;
+        color: #2b7a2b;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>BeamNG-Manager Bridge</h2>
+    <div class="row">
+      <label for="bridgePort">Localhost port:</label>
+      <input id="bridgePort" type="number" min="1024" max="65535" />
+    </div>
+    <div class="row">
+      <label for="bridgePollSeconds">Poll interval (seconds):</label>
+      <input id="bridgePollSeconds" type="number" min="4" max="60" />
+    </div>
+    <div class="row">
+      <button id="saveBtn" type="button">Save</button>
+      <button id="reconnectBtn" type="button">Reconnect bridge</button>
+    </div>
+    <div id="status"></div>
+    <script src="options.js"></script>
+  </body>
+</html>

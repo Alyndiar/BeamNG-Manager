@@ -1,0 +1,48 @@
+{
+  "manifest_version": 2,
+  "name": "BeamNG-Manager Bridge",
+  "version": "0.1.7",
+  "description": "Shows BeamNG-Manager installed/subscribed badges on BeamNG resources/forums.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "http://127.0.0.1/*",
+    "https://www.beamng.com/resources/*",
+    "https://www.beamng.com/forums/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_action": {
+    "default_title": "BeamNG-Manager Bridge",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.beamng.com/resources/*",
+        "https://www.beamng.com/forums/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "beamng-manager-bridge@local",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  }
+}

@@ -21,10 +21,12 @@ def _scan_zips_recursive(root: Path, source: str, pack_name: str | None = None) 
     for path in root.rglob("*.zip"):
         if path.is_file():
             try:
-                size = path.stat().st_size
+                stat = path.stat()
+                size = int(stat.st_size)
+                mtime_ns = int(stat.st_mtime_ns)
             except OSError:
                 continue
-            mods.append(ModEntry(path=path, size=size, source=source, pack_name=pack_name))
+            mods.append(ModEntry(path=path, size=size, source=source, mtime_ns=mtime_ns, pack_name=pack_name))
     return mods
 
 
@@ -35,10 +37,12 @@ def _scan_zips_non_recursive(root: Path, source: str) -> list[ModEntry]:
     for path in root.glob("*.zip"):
         if path.is_file():
             try:
-                size = path.stat().st_size
+                stat = path.stat()
+                size = int(stat.st_size)
+                mtime_ns = int(stat.st_mtime_ns)
             except OSError:
                 continue
-            mods.append(ModEntry(path=path, size=size, source=source))
+            mods.append(ModEntry(path=path, size=size, source=source, mtime_ns=mtime_ns))
     return mods
 
 

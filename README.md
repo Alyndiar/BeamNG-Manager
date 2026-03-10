@@ -1,133 +1,142 @@
 # BeamNG Mod Pack Manager
 
-Windows-only BeamNG mod pack manager built with PySide6 (Qt6).
+Windows desktop mod manager for BeamNG.drive, focused on local mod organization, pack workflows, and safe active-state sync.
 
-The app focuses on local mod organization and active-state management while staying compatible with BeamNG ownership rules.
+## Current Product State
 
-## Current Scope
+- The app is now **Local-only** in the main UI (Online/Console tabs were removed).
+- Browser integration is handled by separate extensions in `integrations/` (Firefox + Chromium build).
+- `info.json` processing is centralized and cached for both list metadata and viewer usage.
 
-### Local tab
+## Main Features
 
-- Pack activation/deactivation via NTFS junctions.
-- Scan and browse mods from:
+### Local Mod Management
+
+- Scans and organizes mods from:
   - `mods` root
   - `mods/repo`
-  - packs in `LibraryRoot`
-  - unknown junction targets
-  - orphan folders
-- Text and icon views with incremental loading for large folders.
-- Prefix/status badges from mod metadata (`info.json` / `prefix_title`), including color-coded badges for common states (`Alpha`, `Beta`, `Experimental`, `Outdated`, `Unsupported`).
-- Multi-select enable/disable with progress reporting.
+  - pack folders in `Library Root`
+  - orphan/unknown junction targets
+- Pack enable/disable using NTFS junction behavior.
 - Move mods between packs and `mods` root.
-  - Moving mods to/from `mods/repo` is blocked.
-- Drag and drop from mod list to packs or `mods` root (subject to confirmation settings).
-- Duplicate finder.
+- Multi-select actions (enable/disable/move/delete where allowed).
+- Duplicate finder with delete callback support.
+- `mods/repo` protections are enforced for destructive actions.
 
-### Profiles
+### Views and Metadata
 
-- Profiles store:
-  - pack activation states
-  - per-mod active states
-- Profile load workflow:
-  - loads `db.json` active states first
-  - compares with profile
-  - when conflicts exist, shows per-mod resolution dialog (`Profile` vs `db.json`)
-  - default choice is `Profile`; `Cancel` makes `db.json` win
-- Profile saving happens only when:
-  - explicit Save is used
-  - app closes and user chooses save
-  - user switches/loads another profile and accepts save prompt
-- Save progress is shown as entry counts (`current/total`) in the status box.
+- Text view and icon view.
+- Sort modes in toolbar (`Name`, `Tags`, `Category`, `Size`).
+- Category badges (repo category and type-derived fallback for non-repo mods where available).
+- Prefix/tag badges (Alpha/Beta/Experimental/etc.).
+- Optional info-label display.
+- `View Metadata` action opens a non-modal `info.json` viewer:
+  - cleaned top `message` section (if present)
+  - tree view with expand/collapse controls
+  - copy JSON / copy message
+  - valid/recovered/invalid/missing handling
 
-### Online tab
+### Profiles and Active State
 
-- Embedded browsing for BeamNG repository/forums.
-- `beamng:v1/...` links are forwarded to BeamNG (no protocol takeover).
-- Direct resource downloads are supported.
-  - Destination choices: `mods` root or a pack folder.
-  - `mods/repo` is intentionally excluded from download destinations.
-- Installed-state badges in browser:
-  - `Subscribed` (mod present in repo folder)
-  - `Manually Installed` (mod present outside repo)
+- Profile save/load with pack-state + mod active-state.
+- Conflict resolution against `db.json` active states.
+- Debounced/safe `db.json` synchronization.
 
-## Safety Rules / Restrictions
+### Runtime Safety
 
-- When `BeamNG.drive.exe` is running, file-mutating actions are blocked.
-  - Includes pack/mod/profile operations and `db.json` writes.
-- BeamNG runtime status is polled by a dedicated worker thread every 15 seconds.
-- On app shutdown:
-  - pending writes are flushed
-  - background operations are awaited before exit
-- `db.json` policy:
-  - only active-state synchronization for existing managed rows
-  - no subscribe/unsubscribe/update logic is performed by this app
-  - no repo subscription management
+- File-mutating actions are blocked while `BeamNG.drive.exe` is running.
+- Runtime status is polled in background.
+- Pending writes/worker tasks are flushed on shutdown.
 
-## UI Notes
+## Browser Bridge + Extensions
 
-- App starts maximized.
-- Status box is used for long-operation progress.
-- BeamNG status indicator square is shown at the right of the status box:
-  - red when BeamNG is running
-  - empty otherwise
-- Confirmation prompts can be globally toggled with `Confirm actions`.
-- Checkbox/view preferences are persisted between runs.
+Extensions live in:
+
+- `integrations/firefox-beamng-manager`
+- `integrations/chrome-beamng-manager`
+
+### What the extension does
+
+- Shows installed/subscribed badges/highlights on BeamNG resources/forums pages.
+- Receives bridge open-url commands from manager (`Open in browser` action for repo mods).
+- Popup/options controls:
+  - bridge port
+  - poll interval
+  - reconnect bridge
+  - last command status (opened/failed + timestamp)
+
+### Bridge protocol (manager localhost server)
+
+- `GET /session/start`
+- `GET /changes`
+- `GET /markers`
+- `GET /commands/next`
+- legacy compatibility: `GET /installed-markers`
+
+### Bridge debug logging
+
+- Manager setting: `Settings -> Bridge Debug`.
+- When enabled, protocol actions are printed to console with `[BridgeDebug ...]`.
 
 ## Requirements
 
-- Windows (NTFS required for junctions)
-- Python 3.10+ (tested on Python 3.12.x)
+- Windows (NTFS required)
+- Python 3.10+ (tested with 3.12)
 - PySide6
+- Optional for development: `pytest`
 
-Optional:
-- `pytest`
-
-## Recommended Python Environment
-
-Using Miniconda is recommended.
-
-Create and use a dedicated environment named `BeamNG-Manager` before installing dependencies, and use this same environment for all program usage (run, tests, and development commands).
+## Recommended Environment
 
 ```powershell
 conda create -n BeamNG-Manager python=3.12 -y
 conda activate BeamNG-Manager
-```
-
-## Install
-
-```powershell
 python -m pip install PySide6 pytest
 ```
 
 ## Run
 
 ```powershell
-python -m app.main
+conda run -n BeamNG-Manager python -m app.main
 ```
 
 ## First Launch
 
-Set paths via `File -> Settings...`:
+Set paths in `Settings...`:
 
-- `BeamNG Mod Folder` (example: `E:\Mount\NekoNeko101\BeamNG.User\current\mods`)
-- `Library Root Folder` (example: `E:\Mount\NekoNeko101\BeamNG.Library`)
-- online cache limits
+- `BeamNG Mod Folder`
+- `Library Root Folder`
+- `Open Repo URL via` (`Default browser` or `Bridge`)
+- `Browser Bridge Port`
+- `Bridge Debug` (optional)
 
-Settings are stored in `QSettings`:
+Settings are stored in `QSettings` under:
 
-- Organization: `BeamNGManager`
-- Application: `ModPackManager`
-- Windows registry path: `HKEY_CURRENT_USER\Software\BeamNGManager\ModPackManager`
+- Org: `BeamNGManager`
+- App: `ModPackManager`
 
-## Development
+## Extension Packaging
 
-### Run tests (recommended command style)
+Firefox (unsigned XPI):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File integrations\firefox-beamng-manager\package_xpi.ps1
+```
+
+Chromium (zip for unpacked/load):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File integrations\chrome-beamng-manager\package_zip.ps1
+```
+
+## Development Commands
+
+Run tests:
 
 ```powershell
 conda run -n BeamNG-Manager python -m pytest -q
 ```
 
-### Quick compile check
+Quick compile check:
 
 ```powershell
 conda run -n BeamNG-Manager python -m py_compile ui/main_window.py
@@ -136,8 +145,9 @@ conda run -n BeamNG-Manager python -m py_compile ui/main_window.py
 ## Project Layout
 
 ```text
-app/main.py
+app/
 core/
 ui/
 tests/
+integrations/
 ```
