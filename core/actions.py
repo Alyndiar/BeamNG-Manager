@@ -8,13 +8,36 @@ from core import junctions
 from core.utils import norm_path
 
 
+_SUBPROCESS_HIDDEN_KWARGS: dict[str, object] = {}
+if hasattr(subprocess, "CREATE_NO_WINDOW"):
+    _SUBPROCESS_HIDDEN_KWARGS["creationflags"] = int(subprocess.CREATE_NO_WINDOW)
+if hasattr(subprocess, "STARTUPINFO") and hasattr(subprocess, "STARTF_USESHOWWINDOW"):
+    startup_info = subprocess.STARTUPINFO()
+    startup_info.dwFlags |= int(subprocess.STARTF_USESHOWWINDOW)
+    startup_info.wShowWindow = 0
+    _SUBPROCESS_HIDDEN_KWARGS["startupinfo"] = startup_info
+
+
+def _run_command(
+    cmd: list[str],
+    *,
+    check: bool = False,
+    capture_output: bool = True,
+    text: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, object] = {
+        "check": bool(check),
+        "capture_output": bool(capture_output),
+        "text": bool(text),
+    }
+    kwargs.update(_SUBPROCESS_HIDDEN_KWARGS)
+    return subprocess.run(cmd, **kwargs)
+
+
 def beamng_is_running() -> bool:
     try:
-        result = subprocess.run(
+        result = _run_command(
             ["tasklist", "/FI", "IMAGENAME eq BeamNG.drive.exe"],
-            check=False,
-            capture_output=True,
-            text=True,
         )
     except OSError:
         return False
@@ -44,7 +67,7 @@ def enable_pack(pack_name: str, beam_mods_root: str | Path, library_root: str | 
         return True, f"Pack already enabled: {pack_name}"
 
     cmd = ["cmd", "/c", "mklink", "/J", str(dest), str(src)]
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    result = _run_command(cmd)
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip() or "mklink failed"
         return False, msg
@@ -66,7 +89,7 @@ def disable_pack(pack_name: str, beam_mods_root: str | Path, library_root: str |
     if not junctions.is_junction(dest):
         return False, f"Refusing to remove non-junction: {dest}"
 
-    result = subprocess.run(["cmd", "/c", "rmdir", str(dest)], check=False, capture_output=True, text=True)
+    result = _run_command(["cmd", "/c", "rmdir", str(dest)])
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip() or "rmdir failed"
         return False, msg
@@ -117,7 +140,7 @@ def delete_empty_pack(pack_name: str, beam_mods_root: str | Path, library_root: 
             return False, f"Junction target mismatch for active pack: {link_path}"
         if beamng_is_running():
             return False, "BeamNG is running. Close BeamNG.drive.exe first."
-        result = subprocess.run(["cmd", "/c", "rmdir", str(link_path)], check=False, capture_output=True, text=True)
+        result = _run_command(["cmd", "/c", "rmdir", str(link_path)])
         if result.returncode != 0:
             msg = result.stderr.strip() or result.stdout.strip() or "rmdir failed"
             return False, msg
@@ -164,7 +187,7 @@ def rename_pack(old_name: str, new_name: str, beam_mods_root: str | Path, librar
         return False, "BeamNG is running. Close BeamNG.drive.exe first."
 
     if was_active:
-        result = subprocess.run(["cmd", "/c", "rmdir", str(old_link)], check=False, capture_output=True, text=True)
+        result = _run_command(["cmd", "/c", "rmdir", str(old_link)])
         if result.returncode != 0:
             msg = result.stderr.strip() or result.stdout.strip() or "rmdir failed"
             return False, msg
@@ -176,7 +199,7 @@ def rename_pack(old_name: str, new_name: str, beam_mods_root: str | Path, librar
 
     if was_active:
         cmd = ["cmd", "/c", "mklink", "/J", str(new_link), str(new_pack)]
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        result = _run_command(cmd)
         if result.returncode != 0:
             msg = result.stderr.strip() or result.stdout.strip() or "mklink failed"
             return False, f"Pack renamed but failed to restore active junction: {msg}"

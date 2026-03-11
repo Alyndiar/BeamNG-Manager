@@ -10,29 +10,11 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
-$IconPng = Join-Path $RepoRoot "ui\assets\icons\BeamNG-Manager.png"
-$IconIco = Join-Path $RepoRoot "packaging\BeamNG-Manager.ico"
+$IconIco = Join-Path $RepoRoot "ui\assets\icons\BeamNG-Manager.ico"
 
-if (-not (Test-Path $IconPng)) {
-    throw "Missing icon source: $IconPng"
+if (-not (Test-Path $IconIco)) {
+    throw "Missing icon file: $IconIco"
 }
-
-$IconBuildScript = @"
-from pathlib import Path
-from PySide6.QtGui import QImage
-
-src = Path(r"$IconPng")
-dst = Path(r"$IconIco")
-img = QImage(str(src))
-if img.isNull():
-    raise SystemExit(f"Failed to load icon source: {src}")
-dst.parent.mkdir(parents=True, exist_ok=True)
-if not img.save(str(dst), "ICO"):
-    raise SystemExit(f"Failed to write icon file: {dst}")
-print(f"Prepared icon: {dst}")
-"@
-
-$IconBuildScript | conda run -n $CondaEnv python -
 
 conda run -n $CondaEnv python -m py_compile ui/main_window.py
 conda run -n $CondaEnv python -m pytest -q

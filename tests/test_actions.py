@@ -92,7 +92,7 @@ def test_rename_pack_active_migrates_junction(tmp_path: Path, monkeypatch) -> No
         stderr = ""
         stdout = ""
 
-    def fake_run(cmd, check, capture_output, text):
+    def fake_run(cmd, check, capture_output, text, **kwargs):
         calls.append(cmd)
         return Result()
 

@@ -11,12 +11,13 @@ if build_variant not in {"gui", "debug"}:
 
 console_mode = build_variant == "debug"
 exe_name = "BeamNG-Manager-debug" if console_mode else "BeamNG-Manager"
-icon_file = project_root / "packaging" / "BeamNG-Manager.ico"
+icon_file = project_root / "ui" / "assets" / "icons" / "BeamNG-Manager.ico"
 icon_path = str(icon_file) if icon_file.is_file() else None
 
 datas = [
     (str(project_root / "ui" / "assets" / "no_preview.png"), "ui/assets"),
     (str(project_root / "ui" / "assets" / "icons" / "BeamNG-Manager.png"), "ui/assets/icons"),
+    (str(project_root / "ui" / "assets" / "icons" / "BeamNG-Manager.ico"), "ui/assets/icons"),
 ]
 
 a = Analysis(
