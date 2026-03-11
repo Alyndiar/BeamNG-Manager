@@ -1,5 +1,4 @@
 {
-  "manifest_version": 3,
   "name": "BeamNG-Manager Bridge",
   "version": "0.1.8",
   "description": "Shows BeamNG-Manager installed/subscribed badges on BeamNG resources/forums and handles open-url bridge requests.",
@@ -8,18 +7,6 @@
     "storage",
     "alarms"
   ],
-  "host_permissions": [
-    "http://127.0.0.1/*",
-    "https://www.beamng.com/resources/*",
-    "https://www.beamng.com/forums/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_title": "BeamNG-Manager Bridge",
-    "default_popup": "popup.html"
-  },
   "content_scripts": [
     {
       "matches": [
@@ -31,6 +18,5 @@
       ],
       "run_at": "document_idle"
     }
-  ],
-  "options_page": "options.html"
+  ]
 }
