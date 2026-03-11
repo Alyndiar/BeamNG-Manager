@@ -87,7 +87,7 @@ from core.state_sync import (
 from core.modpreview import read_preview_image
 from core.modinfo import get_info_json_analysis_cached, get_mod_info_cached, set_default_mod_info_cache
 from core import scanner
-from core.utils import human_size
+from core.utils import app_root_dir, human_size, ui_asset_path
 from ui.duplicates_dialog import DuplicatesDialog
 from ui.info_json_viewer_dialog import InfoJsonViewerDialog
 from ui.settings_dialog import (
@@ -532,7 +532,7 @@ class MainWindow(QMainWindow):
         _startup_last_profile = str(self.settings_store.value("last_profile_path", "", str) or "").strip()
         self._startup_last_profile_to_apply: Path | None = Path(_startup_last_profile) if _startup_last_profile else None
         self._startup_profile_apply_pending = True
-        self.project_root = Path(__file__).resolve().parents[1]
+        self.project_root = app_root_dir()
         self.db_path = Path()
         self.active_by_db_fullpath: dict[str, bool] = {}
         self._updating_mod_table = False
@@ -615,8 +615,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _init_preview_cache_storage(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        self.preview_cache_dir = project_root / ".cache" / "icon_preview_cache"
+        self.preview_cache_dir = self.project_root / ".cache" / "icon_preview_cache"
         self.preview_cache_index_file = self.preview_cache_dir / "index.json"
         self.preview_cache_dir.mkdir(parents=True, exist_ok=True)
         self.mod_preview_cache = {}
@@ -655,8 +654,7 @@ class MainWindow(QMainWindow):
             self.mod_preview_index = {}
 
     def _init_mod_info_cache_storage(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        cache_dir = project_root / ".cache" / "mod_info_cache"
+        cache_dir = self.project_root / ".cache" / "mod_info_cache"
         self.mod_info_cache_file = cache_dir / "cache.pkl"
         self.mod_info_cache.load_from_file(self.mod_info_cache_file)
 
@@ -1623,7 +1621,7 @@ class MainWindow(QMainWindow):
         return QIcon(pix)
 
     def _load_missing_preview_pixmap(self) -> QPixmap:
-        asset = Path(__file__).resolve().parent / "assets" / "no_preview.png"
+        asset = ui_asset_path("no_preview.png")
         pix = QPixmap(str(asset))
         if not pix.isNull():
             return pix

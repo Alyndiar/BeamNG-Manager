@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 .cache/
 Profiles/
+build/
+dist/
+packaging/BeamNG-Manager.ico

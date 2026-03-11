@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [gui, debug]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: BeamNG-Manager
+          auto-activate-base: false
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        shell: powershell
+        run: |
+          conda run -n BeamNG-Manager python -m pip install --disable-pip-version-check PySide6 pytest pyinstaller
+
+      - name: Build artifact
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build_release_artifact.ps1 -Variant ${{ matrix.variant }} -Version "${{ github.ref_name }}"
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-exe-${{ matrix.variant }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  build-extensions:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build extension artifacts
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build_extension_release_artifacts.ps1 -OutputDir "dist/release"
+
+      - name: Upload extension outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-extensions
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-exe, build-extensions]
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

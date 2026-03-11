@@ -85,9 +85,25 @@ Extensions live in:
 - PySide6
 - Optional for development: `pytest`
 
-## Recommended Environment
+## Ways to Use
+
+1. Standalone release build (no Python setup required):
+- Download from GitHub Releases:
+  - `BeamNG-Manager-<version>-windows-x64.zip` (normal GUI)
+  - `BeamNG-Manager-<version>-windows-x64-debug-console.zip` (console troubleshooting)
+- Extract the ZIP to its own folder and run the EXE from there.
+- Keep the EXE in that folder before first launch; runtime folders are created beside it (`.cache/`, `Profiles/`).
+
+2. Manual install from GitHub source:
+- Clone this repository.
+- Create/use the `BeamNG-Manager` conda environment.
+- Install dependencies and run with Python.
+
+## Manual Install (Source)
 
 ```powershell
+git clone <repo-url>
+cd BeamNG-Manager
 conda create -n BeamNG-Manager python=3.12 -y
 conda activate BeamNG-Manager
 python -m pip install PySide6 pytest
@@ -98,6 +114,39 @@ python -m pip install PySide6 pytest
 ```powershell
 conda run -n BeamNG-Manager python -m app.main
 ```
+
+## Executable Builds (PyInstaller)
+
+Important first-run rule for EXE builds:
+
+- Put the EXE in its own folder before running it for the first time.
+- The app creates runtime data folders relative to the EXE folder:
+  - `.cache/`
+  - `Profiles/`
+
+`QSettings` stays in the normal Windows registry location.
+
+Local build commands:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant gui -Version 0.5.1
+powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant debug -Version 0.5.1
+```
+
+GitHub releases:
+
+- Tag push triggers `.github/workflows/release.yml`.
+- The workflow builds both EXE variants and uploads both ZIPs + SHA256 files to the release.
+- The workflow also packages extension artifacts and uploads:
+  - Chrome bridge ZIP
+  - Firefox unsigned XPI
+  - SHA256 files
+  - `extension-links.md` metadata file (includes the current Firefox unpublished download link)
+
+Firefox unpublished link source:
+
+- `integrations/firefox-beamng-manager/latest_unpublished_download_url.txt`
+- If Firefox extension `manifest.json` version changes, this link must be updated to the matching version before release.
 
 ## First Launch
 
@@ -150,4 +199,6 @@ core/
 ui/
 tests/
 integrations/
+packaging/
+scripts/
 ```

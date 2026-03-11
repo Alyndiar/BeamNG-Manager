@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 
@@ -33,3 +34,24 @@ def norm_path(path: str) -> str:
 
 def safe_rel_depth(path_in_zip: str) -> int:
     return len([p for p in path_in_zip.replace("\\", "/").split("/") if p])
+
+
+def is_frozen_app() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_root_dir() -> Path:
+    if is_frozen_app():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def resource_root_dir() -> Path:
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        return Path(str(bundled_root))
+    return Path(__file__).resolve().parents[1]
+
+
+def ui_asset_path(*parts: str) -> Path:
+    return resource_root_dir() / "ui" / "assets" / Path(*parts)
