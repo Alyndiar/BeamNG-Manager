@@ -6,9 +6,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$integrationsDir = Split-Path -Parent $scriptDir
+$buildScriptPath = Join-Path $integrationsDir "build-manifest.js"
+$generatedManifestPath = Join-Path (Join-Path $integrationsDir "dist\chrome") "manifest.json"
 $manifestPath = Join-Path $scriptDir "manifest.json"
 if (-not (Test-Path -LiteralPath $manifestPath)) {
     throw "manifest.json not found in $scriptDir"
+}
+if (-not (Test-Path -LiteralPath $buildScriptPath)) {
+    throw "build-manifest.js not found in $integrationsDir"
+}
+
+& node $buildScriptPath "chrome"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build chrome manifest"
+}
+if (-not (Test-Path -LiteralPath $generatedManifestPath)) {
+    throw "Generated chrome manifest not found at $generatedManifestPath"
 }
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -53,7 +67,8 @@ $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.Zi
 try {
     foreach ($file in $files) {
         $relative = $file.FullName.Substring($scriptDir.Length).TrimStart('\\').Replace('\\', '/')
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $relative) | Out-Null
+        $sourcePath = if ($relative -ieq "manifest.json") { $generatedManifestPath } else { $file.FullName }
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $sourcePath, $relative) | Out-Null
     }
 }
 finally {

@@ -152,14 +152,26 @@ function parseOpenCommand(command) {
   }
   const id = Number(command.id);
   const url = String(command.url || "").trim();
-  if (!url) {
-    return null;
-  }
-  const lower = url.toLowerCase();
-  if (!(lower.startsWith("https://") || lower.startsWith("http://"))) {
+  if (!isAllowedBeamngUrl(url)) {
     return null;
   }
   return { id: Number.isFinite(id) && id > 0 ? id : 0, url };
+}
+
+function isAllowedBeamngUrl(rawUrl) {
+  if (!rawUrl) {
+    return false;
+  }
+  let parsed = null;
+  try {
+    parsed = new URL(String(rawUrl).trim());
+  } catch (_err) {
+    return false;
+  }
+  if (parsed.origin !== "https://www.beamng.com") {
+    return false;
+  }
+  return parsed.pathname.startsWith("/resources/") || parsed.pathname.startsWith("/forums/");
 }
 
 async function openCommandUrl(command) {
@@ -339,7 +351,7 @@ extApi.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" || !tab || !tab.id || !tab.url) {
     return;
   }
-  if (!TAB_MATCH_PATTERNS.some((pattern) => tab.url.startsWith(pattern.replace("*", "")))) {
+  if (!isAllowedBeamngUrl(tab.url)) {
     return;
   }
   if (online && currentPayload) {
