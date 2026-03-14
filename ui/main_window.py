@@ -120,6 +120,7 @@ _ICON_ACTIVE_INDICATOR_SIZE = 22
 _DB_WRITE_DEBOUNCE_MS = 900
 _DB_WRITE_FLUSH_WAIT_SECONDS = 6.0
 _PROFILE_SAVE_TIMEOUT_SECONDS = 45.0
+_BRIDGE_LOG_MAX_ENTRIES = 50
 
 _VEHICLES_LINE2 = ["Name", "Brand", "Author", "Country", "Body Style", "Type", "Years", "Derby Class"]
 _VEHICLES_LINE3 = ["Description", "Slogan"]
@@ -491,7 +492,44 @@ class FlowLayout(QLayout):
         return used_height + margins.top() + margins.bottom()
 
 
+class BridgeDebugLogDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Bridge Debug Log")
+        self.resize(920, 520)
+
+        self.version_line = QLabel(self)
+        self.version_line.setWordWrap(True)
+
+        self.log_box = QPlainTextEdit(self)
+        self.log_box.setReadOnly(True)
+        self.log_box.setLineWrapMode(QPlainTextEdit.NoWrap)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.version_line)
+        layout.addWidget(self.log_box, 1)
+
+    def set_content(self, expected_version: str, current_version: str, entries: list[str]) -> None:
+        expected = str(expected_version or "").strip() or "unknown"
+        current = str(current_version or "").strip() or "unknown"
+        mismatch = expected != "unknown" and current != "unknown" and expected != current
+
+        self.version_line.setText(f"Expected extension version: {expected} | Current extension version: {current}")
+        if mismatch:
+            self.version_line.setStyleSheet("color: #b31d1d; font-weight: 600;")
+        else:
+            self.version_line.setStyleSheet("")
+
+        text = "\n".join(entries)
+        if self.log_box.toPlainText() != text:
+            self.log_box.setPlainText(text)
+            bar = self.log_box.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+
 class MainWindow(QMainWindow):
+    bridgeLogMessage = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("BeamNG Mod Pack Manager")
@@ -522,6 +560,11 @@ class MainWindow(QMainWindow):
         self._info_json_viewers: list[InfoJsonViewerDialog] = []
         self.firefox_bridge_server: FirefoxBridgeServer | None = None
         self._bridge_last_consumed_command_id = 0
+        self._bridge_log_entries: list[str] = []
+        self._bridge_log_dialog: BridgeDebugLogDialog | None = None
+        self._bridge_expected_extension_version = ""
+        self._bridge_current_extension_version = ""
+        self.bridgeLogMessage.connect(self._on_bridge_log_message)
         self.settings_store = QSettings("BeamNGManager", "ModPackManager")
         self.confirm_actions_enabled = bool(self.settings_store.value("confirm_actions_enabled", True, bool))
         self.info_caption_enabled = bool(self.settings_store.value("info_caption_enabled", False, bool))
@@ -663,11 +706,56 @@ class MainWindow(QMainWindow):
             return
         self.mod_info_cache.save_to_file(self.mod_info_cache_file)
 
+    def _refresh_bridge_version_state(self) -> None:
+        server = self.firefox_bridge_server
+        if server is None:
+            self._bridge_expected_extension_version = ""
+            self._bridge_current_extension_version = ""
+            self._update_bridge_log_dialog()
+            return
+        expected, current = server.extension_version_state()
+        self._bridge_expected_extension_version = str(expected or "").strip()
+        self._bridge_current_extension_version = str(current or "").strip()
+        self._update_bridge_log_dialog()
+
+    def _append_bridge_log_entry(self, text: str) -> None:
+        value = str(text or "").strip()
+        if not value:
+            return
+        self._bridge_log_entries.append(value)
+        if len(self._bridge_log_entries) > _BRIDGE_LOG_MAX_ENTRIES:
+            self._bridge_log_entries = self._bridge_log_entries[-_BRIDGE_LOG_MAX_ENTRIES:]
+        self._update_bridge_log_dialog()
+
+    def _on_bridge_log_message(self, message: str) -> None:
+        self._append_bridge_log_entry(message)
+
+    def _update_bridge_log_dialog(self) -> None:
+        dialog = self._bridge_log_dialog
+        if dialog is None:
+            return
+        dialog.set_content(
+            self._bridge_expected_extension_version,
+            self._bridge_current_extension_version,
+            self._bridge_log_entries,
+        )
+
+    def _open_bridge_log_dialog(self) -> None:
+        dialog = self._bridge_log_dialog
+        if dialog is None:
+            dialog = BridgeDebugLogDialog(self)
+            self._bridge_log_dialog = dialog
+        self._refresh_bridge_version_state()
+        self._update_bridge_log_dialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _bridge_debug_log(self, message: str) -> None:
         text = str(message or "").strip()
         if not text:
             return
-        print(text, flush=True)
+        self.bridgeLogMessage.emit(text)
 
     def _start_firefox_bridge_server(self) -> None:
         preferred = max(1024, min(65535, int(self.firefox_bridge_port)))
@@ -683,16 +771,20 @@ class MainWindow(QMainWindow):
             self._bridge_last_consumed_command_id = 0
             self.firefox_bridge_port = int(preferred)
             self._set_status_line3(message)
+            self._refresh_bridge_version_state()
             return
         self._set_status_line3(f"Firefox bridge unavailable on configured port {preferred}: {message}")
+        self._refresh_bridge_version_state()
 
     def _stop_firefox_bridge_server(self) -> None:
         server = self.firefox_bridge_server
         self.firefox_bridge_server = None
         self._bridge_last_consumed_command_id = 0
         if server is None:
+            self._refresh_bridge_version_state()
             return
         server.stop()
+        self._refresh_bridge_version_state()
 
     def _restart_firefox_bridge_server(self) -> None:
         self._stop_firefox_bridge_server()
@@ -701,7 +793,9 @@ class MainWindow(QMainWindow):
     def _poll_bridge_events(self) -> None:
         server = self.firefox_bridge_server
         if server is None:
+            self._refresh_bridge_version_state()
             return
+        self._refresh_bridge_version_state()
         consumed = server.drain_consumed_commands()
         if not consumed:
             return
@@ -2486,6 +2580,10 @@ class MainWindow(QMainWindow):
         find_dupes_action = QAction("Find duplicates...", self)
         find_dupes_action.triggered.connect(self._open_duplicates)
         tools_menu.addAction(find_dupes_action)
+
+        bridge_log_action = QAction("Bridge debug log...", self)
+        bridge_log_action.triggered.connect(self._open_bridge_log_dialog)
+        tools_menu.addAction(bridge_log_action)
 
     def _load_settings_and_maybe_scan(self) -> None:
         beam_mods, library = load_settings()

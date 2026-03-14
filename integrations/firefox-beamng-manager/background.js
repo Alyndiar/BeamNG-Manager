@@ -9,6 +9,13 @@ const TAB_MATCH_PATTERNS = [
   "https://www.beamng.com/resources/*",
   "https://www.beamng.com/forums/*"
 ];
+const EXTENSION_VERSION = (() => {
+  try {
+    return String(extApi.runtime.getManifest().version || "").trim();
+  } catch (_err) {
+    return "";
+  }
+})();
 
 let currentPort = null;
 let currentPayload = null;
@@ -63,8 +70,17 @@ async function fetchJson(url) {
   return response.json();
 }
 
+function withExtensionVersion(rawUrl) {
+  const url = new URL(String(rawUrl));
+  if (EXTENSION_VERSION) {
+    url.searchParams.set("extension_version", EXTENSION_VERSION);
+  }
+  return url;
+}
+
 async function startSession(port) {
-  const payload = await fetchJson(`http://127.0.0.1:${port}/session/start`);
+  const url = withExtensionVersion(`http://127.0.0.1:${port}/session/start`);
+  const payload = await fetchJson(url.toString());
   if (!payload || payload.ok !== true) {
     throw new Error("Invalid session payload");
   }
@@ -76,6 +92,9 @@ async function fetchChanges(port) {
   url.searchParams.set("session_id", String(sessionId || ""));
   url.searchParams.set("markers_rev", String(markersRev));
   url.searchParams.set("commands_rev", String(commandsRev));
+  if (EXTENSION_VERSION) {
+    url.searchParams.set("extension_version", EXTENSION_VERSION);
+  }
   const payload = await fetchJson(url.toString());
   if (!payload || payload.ok !== true) {
     throw new Error("Invalid changes payload");
@@ -86,6 +105,9 @@ async function fetchChanges(port) {
 async function fetchMarkers(port) {
   const url = new URL(`http://127.0.0.1:${port}/markers`);
   url.searchParams.set("session_id", String(sessionId || ""));
+  if (EXTENSION_VERSION) {
+    url.searchParams.set("extension_version", EXTENSION_VERSION);
+  }
   const payload = await fetchJson(url.toString());
   if (!payload || payload.ok !== true) {
     throw new Error("Invalid markers payload");
@@ -96,6 +118,9 @@ async function fetchMarkers(port) {
 async function fetchNextCommand(port) {
   const url = new URL(`http://127.0.0.1:${port}/commands/next`);
   url.searchParams.set("session_id", String(sessionId || ""));
+  if (EXTENSION_VERSION) {
+    url.searchParams.set("extension_version", EXTENSION_VERSION);
+  }
   const payload = await fetchJson(url.toString());
   if (!payload || payload.ok !== true) {
     throw new Error("Invalid commands payload");

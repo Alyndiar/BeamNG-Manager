@@ -25,6 +25,7 @@ if ($LASTEXITCODE -ne 0) {
 
 $chromeManifestPath = Join-Path $RepoRoot "integrations\chrome-beamng-manager\manifest.json"
 $firefoxManifestPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\manifest.json"
+$firefoxOfficialLinkPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\official_listing_url.txt"
 $firefoxDownloadLinkPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\latest_unpublished_download_url.txt"
 
 $chromeVersion = [string]((Get-Content -LiteralPath $chromeManifestPath -Raw | ConvertFrom-Json).version)
@@ -33,28 +34,45 @@ if ([string]::IsNullOrWhiteSpace($chromeVersion) -or [string]::IsNullOrWhiteSpac
     throw "Missing extension version in one or more extension manifest files."
 }
 
-if (-not (Test-Path -LiteralPath $firefoxDownloadLinkPath)) {
-    throw "Missing Firefox unpublished download URL file: $firefoxDownloadLinkPath"
-}
-$firefoxDownloadLink = (Get-Content -LiteralPath $firefoxDownloadLinkPath -Raw).Trim()
-if ([string]::IsNullOrWhiteSpace($firefoxDownloadLink)) {
-    throw "Firefox unpublished download URL is empty: $firefoxDownloadLinkPath"
+$firefoxPublicLink = ""
+$firefoxPublicLinkLabel = ""
+$usingUnpublishedLink = $false
+
+if (Test-Path -LiteralPath $firefoxOfficialLinkPath) {
+    $firefoxPublicLink = (Get-Content -LiteralPath $firefoxOfficialLinkPath -Raw).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
+        $firefoxPublicLinkLabel = "Firefox official listing"
+    }
 }
 
-$linkVersion = ""
-$match = [System.Text.RegularExpressions.Regex]::Match(
-    $firefoxDownloadLink,
-    "beamng_manager_bridge-(?<version>\d+\.\d+\.\d+)\.xpi",
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-)
-if ($match.Success) {
-    $linkVersion = [string]$match.Groups["version"].Value
+if ([string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
+    if (-not (Test-Path -LiteralPath $firefoxDownloadLinkPath)) {
+        throw "Missing Firefox extension link file. Expected one of: $firefoxOfficialLinkPath or $firefoxDownloadLinkPath"
+    }
+    $firefoxPublicLink = (Get-Content -LiteralPath $firefoxDownloadLinkPath -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
+        throw "Firefox extension link is empty in: $firefoxDownloadLinkPath"
+    }
+    $firefoxPublicLinkLabel = "Firefox unpublished direct download"
+    $usingUnpublishedLink = $true
 }
-if (-not [string]::IsNullOrWhiteSpace($linkVersion) -and $linkVersion -ne $firefoxVersion) {
-    throw (
-        "Firefox extension manifest is $firefoxVersion but configured unpublished AMO link is $linkVersion. " +
-        "Please provide the updated AMO download URL before release."
+
+if ($usingUnpublishedLink) {
+    $linkVersion = ""
+    $match = [System.Text.RegularExpressions.Regex]::Match(
+        $firefoxPublicLink,
+        "beamng_manager_bridge-(?<version>\d+\.\d+\.\d+)\.xpi",
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
     )
+    if ($match.Success) {
+        $linkVersion = [string]$match.Groups["version"].Value
+    }
+    if (-not [string]::IsNullOrWhiteSpace($linkVersion) -and $linkVersion -ne $firefoxVersion) {
+        throw (
+            "Firefox extension manifest is $firefoxVersion but configured unpublished AMO link is $linkVersion. " +
+            "Please provide the updated AMO download URL before release."
+        )
+    }
 }
 
 & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "integrations\chrome-beamng-manager\package_zip.ps1") -OutputDir $extensionsDir
@@ -82,13 +100,29 @@ foreach ($assetPath in @($chromeZip, $firefoxXpi)) {
     "$hash *$(Split-Path -Leaf $assetPath)" | Set-Content -Path $shaPath -Encoding Ascii
 }
 
-$linksPath = Join-Path $outputRoot "extension-links.md"
-@(
-    "# Extension Links"
-    ""
-    "- Chrome: use the attached ZIP artifact (`$([System.IO.Path]::GetFileName($chromeZip))`) with Developer Mode / Load unpacked flow."
-    "- Firefox (unpublished listing direct download): $firefoxDownloadLink"
-) | Set-Content -LiteralPath $linksPath -Encoding UTF8
+$linksPath = Join-Path $outputRoot "extension-links.html"
+$chromeZipName = [System.IO.Path]::GetFileName($chromeZip)
+$html = @"
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>BeamNG-Manager Extension Links</title>
+    <style>
+      body { font-family: Segoe UI, Arial, sans-serif; margin: 24px; }
+      h1 { margin-top: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Extension Links</h1>
+    <ul>
+      <li>Chrome: use the attached ZIP artifact (<code>$chromeZipName</code>) with Developer Mode / Load unpacked.</li>
+      <li>${firefoxPublicLinkLabel}: <a href="$firefoxPublicLink">$firefoxPublicLink</a></li>
+    </ul>
+  </body>
+</html>
+"@
+$html | Set-Content -LiteralPath $linksPath -Encoding UTF8
 
 Write-Host "Created extension artifacts in: $extensionsDir"
 Write-Host "Created extension link metadata: $linksPath"

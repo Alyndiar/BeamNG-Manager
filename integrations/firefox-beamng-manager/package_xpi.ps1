@@ -76,3 +76,37 @@ finally {
 }
 
 Write-Host "Created unsigned XPI: $xpiPath"
+
+$docName = "beamng-manager-bridge-firefox-$version-release-notes.txt"
+$docPath = Join-Path $outputRoot $docName
+$docLines = @(
+    "BeamNG-Manager Bridge - Firefox Release Notes (v$version)"
+    ""
+    "What the extension does"
+    "- Shows BeamNG-Manager install status badges/highlights (Subscribed / Manually Installed) on:"
+    "  - https://www.beamng.com/resources/*"
+    "  - https://www.beamng.com/forums/*"
+    "- Connects to local BeamNG-Manager bridge over loopback (http://127.0.0.1/*)."
+    "- Receives and executes validated open-page commands for BeamNG resource/forum URLs."
+    "- Provides options for bridge port, poll interval, reconnect, and extension/manager version compatibility check."
+    ""
+    "Permission justification and safety controls"
+    "1) tabs"
+    "- Why: query matching BeamNG tabs, send marker updates, open validated BeamNG URLs on command."
+    "- Safety: strict BeamNG URL allowlist; no broad browsing history extraction."
+    ""
+    "2) storage"
+    "- Why: save local settings (bridge port, poll interval) and last command status."
+    "- Safety: local-only operational state; no credentials or personal data."
+    ""
+    "3) host permissions (declared in Firefox permissions list)"
+    "- http://127.0.0.1/* : local bridge communication only."
+    "- https://www.beamng.com/resources/* and https://www.beamng.com/forums/* : content script injection and marker rendering only on BeamNG pages."
+    ""
+    "Privacy and data handling"
+    "- No external telemetry/analytics."
+    "- No account credential access."
+    "- Network communication is limited to BeamNG pages and local loopback bridge."
+)
+Set-Content -LiteralPath $docPath -Value $docLines -Encoding UTF8
+Write-Host "Created Firefox release notes: $docPath"

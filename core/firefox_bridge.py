@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 MarkersProvider = Callable[[], tuple[set[str], set[str], set[str], set[str]]]
 DebugLogger = Callable[[str], None]
 _BRIDGE_PROTOCOL_VERSION = 2
+_EXPECTED_EXTENSION_VERSION = "0.1.8"
 
 
 class FirefoxBridgeServer:
@@ -22,6 +23,7 @@ class FirefoxBridgeServer:
         port: int = 49441,
         debug_enabled: bool = False,
         debug_logger: DebugLogger | None = None,
+        expected_extension_version: str = _EXPECTED_EXTENSION_VERSION,
     ) -> None:
         self._markers_provider = markers_provider
         self._host = host
@@ -38,6 +40,8 @@ class FirefoxBridgeServer:
         self._session_id = uuid.uuid4().hex
         self._debug_enabled = bool(debug_enabled)
         self._debug_logger = debug_logger
+        self._expected_extension_version = str(expected_extension_version or _EXPECTED_EXTENSION_VERSION).strip()
+        self._current_extension_version = ""
 
     def set_debug_enabled(self, enabled: bool) -> None:
         self._debug_enabled = bool(enabled)
@@ -71,6 +75,19 @@ class FirefoxBridgeServer:
             return text
         return f"{text[:117]}..."
 
+    def extension_version_state(self) -> tuple[str, str]:
+        with self._state_lock:
+            return str(self._expected_extension_version), str(self._current_extension_version)
+
+    def _record_extension_version(self, extension_version: str) -> None:
+        value = str(extension_version or "").strip()
+        if not value:
+            return
+        with self._state_lock:
+            if value == self._current_extension_version:
+                return
+            self._current_extension_version = value
+
     def start(self) -> tuple[bool, str]:
         if self._server is not None:
             self._debug(f"start() ignored: already running on {self._host}:{self._port}")
@@ -83,10 +100,21 @@ class FirefoxBridgeServer:
                 parsed = urlparse(self.path)
                 path = str(parsed.path or "")
                 query = parse_qs(parsed.query, keep_blank_values=False)
+                owner._record_extension_version(_qs_first(query, "extension_version"))
                 owner._debug(f"GET {path} from {self.client_address[0]} query='{parsed.query}'")
                 if path == "/health":
                     self._write_json(200, {"ok": True})
                     owner._debug("GET /health -> ok")
+                    return
+                if path == "/extension/version":
+                    payload = owner._extension_version_payload()
+                    self._write_json(200, payload)
+                    owner._debug(
+                        "GET /extension/version -> "
+                        f"expected={payload.get('expected_extension_version')} "
+                        f"current={payload.get('current_extension_version')} "
+                        f"match={payload.get('version_match')}"
+                    )
                     return
                 if path == "/session/start":
                     payload = owner._session_start_payload()
@@ -249,13 +277,30 @@ class FirefoxBridgeServer:
     def _session_start_payload(self) -> dict[str, object]:
         with self._state_lock:
             self._refresh_markers_state_locked()
+            current = str(self._current_extension_version)
+            expected = str(self._expected_extension_version)
             return {
                 "ok": True,
                 "protocol_version": _BRIDGE_PROTOCOL_VERSION,
                 "session_id": self._session_id,
                 "markers_rev": int(self._markers_revision),
                 "commands_rev": int(self._commands_revision),
+                "expected_extension_version": expected,
+                "current_extension_version": current,
+                "version_match": bool(expected and current and expected == current),
             }
+
+    def _extension_version_payload(self) -> dict[str, object]:
+        with self._state_lock:
+            expected = str(self._expected_extension_version)
+            current = str(self._current_extension_version)
+        return {
+            "ok": True,
+            "protocol_version": _BRIDGE_PROTOCOL_VERSION,
+            "expected_extension_version": expected,
+            "current_extension_version": current,
+            "version_match": bool(expected and current and expected == current),
+        }
 
     def _changes_payload(self, session_id: str, markers_rev: int, commands_rev: int) -> dict[str, object]:
         with self._state_lock:

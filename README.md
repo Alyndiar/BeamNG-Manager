@@ -90,7 +90,6 @@ Extensions live in:
 1. Standalone release build (no Python setup required):
 - Download from GitHub Releases:
   - `BeamNG-Manager-<version>-windows-x64.zip` (normal GUI)
-  - `BeamNG-Manager-<version>-windows-x64-debug-console.zip` (console troubleshooting)
 - Extract the ZIP to its own folder and run the EXE from there.
 - Keep the EXE in that folder before first launch; runtime folders are created beside it (`.cache/`, `Profiles/`).
 
@@ -133,20 +132,23 @@ powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Var
 powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant debug -Version 0.5.1
 ```
 
+The debug-console variant is intended for local troubleshooting only and is not published as a normal release artifact.
+
 GitHub releases:
 
 - Tag push triggers `.github/workflows/release.yml`.
-- The workflow builds both EXE variants and uploads both ZIPs + SHA256 files to the release.
+- The workflow builds the GUI EXE and uploads its ZIP + SHA256 file to the release.
 - The workflow also packages extension artifacts and uploads:
   - Chrome bridge ZIP
   - Firefox unsigned XPI
   - SHA256 files
-  - `extension-links.md` metadata file (includes the current Firefox unpublished download link)
+  - `extension-links.html` metadata file (includes the current Firefox unpublished download link)
 
 Firefox unpublished link source:
 
-- `integrations/firefox-beamng-manager/latest_unpublished_download_url.txt`
-- If Firefox extension `manifest.json` version changes, this link must be updated to the matching version before release.
+- Preferred: `integrations/firefox-beamng-manager/official_listing_url.txt`
+- Fallback (if unpublished): `integrations/firefox-beamng-manager/latest_unpublished_download_url.txt`
+- If using the unpublished direct download link and Firefox extension `manifest.json` version changes, the link must be updated to the matching version before release.
 
 ## First Launch
 
