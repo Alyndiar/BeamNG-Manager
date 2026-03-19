@@ -5,18 +5,22 @@ on:
     tags:
       - "*"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-exe:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Conda
         uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: BeamNG-Manager
-          auto-activate-base: false
+          auto-activate: false
+          channels: conda-forge,defaults
           python-version: "3.12"
 
       - name: Install build dependencies
@@ -30,7 +34,7 @@ jobs:
           powershell -ExecutionPolicy Bypass -File scripts/build_release_artifact.ps1 -Variant gui -Version "${{ github.ref_name }}"
 
       - name: Upload build outputs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-exe-gui
           path: dist/release/*
@@ -40,12 +44,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Build extension artifacts
         shell: powershell
@@ -53,7 +57,7 @@ jobs:
           powershell -ExecutionPolicy Bypass -File scripts/build_extension_release_artifacts.ps1 -OutputDir "dist/release"
 
       - name: Upload extension outputs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-extensions
           path: dist/release/*
@@ -66,7 +70,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
