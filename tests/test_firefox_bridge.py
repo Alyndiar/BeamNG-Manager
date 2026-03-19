@@ -5,6 +5,7 @@ import socket
 import urllib.request
 from urllib.parse import quote
 
+import core.firefox_bridge as firefox_bridge
 from core.firefox_bridge import FirefoxBridgeServer
 
 
@@ -15,6 +16,15 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
     finally:
         sock.close()
+
+
+def test_expected_extension_version_reads_manifest_base(tmp_path, monkeypatch) -> None:
+    integrations_dir = tmp_path / "integrations"
+    integrations_dir.mkdir(parents=True)
+    (integrations_dir / "manifest.base.json").write_text('{"version":"0.1.9"}', encoding="utf-8")
+    monkeypatch.setattr(firefox_bridge, "resource_root_dir", lambda: tmp_path)
+
+    assert firefox_bridge._expected_extension_version_from_manifests() == "0.1.9"
 
 
 def test_firefox_bridge_health_and_markers() -> None:

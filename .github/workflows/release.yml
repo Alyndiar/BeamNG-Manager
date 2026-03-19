@@ -8,10 +8,6 @@ on:
 jobs:
   build-exe:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [gui, debug]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,12 +27,12 @@ jobs:
       - name: Build artifact
         shell: powershell
         run: |
-          powershell -ExecutionPolicy Bypass -File scripts/build_release_artifact.ps1 -Variant ${{ matrix.variant }} -Version "${{ github.ref_name }}"
+          powershell -ExecutionPolicy Bypass -File scripts/build_release_artifact.ps1 -Variant gui -Version "${{ github.ref_name }}"
 
       - name: Upload build outputs
         uses: actions/upload-artifact@v4
         with:
-          name: release-exe-${{ matrix.variant }}
+          name: release-exe-gui
           path: dist/release/*
           if-no-files-found: error
 

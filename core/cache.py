@@ -5,6 +5,8 @@ from pathlib import Path
 import pickle
 import threading
 
+_MOD_INFO_CACHE_VERSION = 2
+
 
 @dataclass(slots=True)
 class ModEntry:
@@ -99,7 +101,7 @@ class ModInfoCache:
             return
         if not isinstance(payload, dict):
             return
-        if payload.get("version") != 1:
+        if payload.get("version") != _MOD_INFO_CACHE_VERSION:
             return
         entries = payload.get("entries")
         if not isinstance(entries, dict):
@@ -114,7 +116,7 @@ class ModInfoCache:
 
     def save_to_file(self, cache_file: Path) -> None:
         with self._lock:
-            payload = {"version": 1, "entries": dict(self._cache)}
+            payload = {"version": _MOD_INFO_CACHE_VERSION, "entries": dict(self._cache)}
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))

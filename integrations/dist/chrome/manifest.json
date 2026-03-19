@@ -1,6 +1,6 @@
 {
   "name": "BeamNG-Manager Bridge",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Shows BeamNG-Manager installed/subscribed badges on BeamNG resources/forums and handles open-url bridge requests.",
   "permissions": [
     "tabs",
