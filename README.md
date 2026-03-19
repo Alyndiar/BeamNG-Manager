@@ -57,6 +57,8 @@ Extensions live in:
 
 - `integrations/firefox-beamng-manager`
 - `integrations/chrome-beamng-manager`
+- Firefox Add-ons listing: <https://addons.mozilla.org/fr/firefox/addon/beamng-manager-bridge/>
+- Chrome Web Store listing: <https://chromewebstore.google.com/detail/hhilmajldhikjnjeafjfihpnkmbodggh>
 
 ### What the extension does
 
@@ -92,7 +94,8 @@ Extensions live in:
 
 1. Standalone release build (no Python setup required):
 - Download from GitHub Releases:
-  - `BeamNG-Manager-<version>-windows-x64.zip` (normal GUI)
+  - `BeamNG-Manager-<version>-windows-x64.zip` (recommended)
+  - `BeamNG-Manager-<version>-windows-x64.exe` (single-file executable)
 - Extract the ZIP to its own folder and run the EXE from there.
 - Keep the EXE in that folder before first launch; runtime folders are created beside it (`.cache/`, `Profiles/`).
 
@@ -132,6 +135,7 @@ Local build commands:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant gui -Version 0.5.1
+powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant gui -Version 0.5.1 -IncludeRawExe
 powershell -ExecutionPolicy Bypass -File scripts\build_release_artifact.ps1 -Variant debug -Version 0.5.1
 ```
 
@@ -140,18 +144,10 @@ The debug-console variant is intended for local troubleshooting only and is not 
 GitHub releases:
 
 - Tag push triggers `.github/workflows/release.yml`.
-- The workflow builds the GUI EXE and uploads its ZIP + SHA256 file to the release.
-- The workflow also packages extension artifacts and uploads:
-  - Chrome bridge ZIP
-  - Firefox unsigned XPI
-  - SHA256 files
-  - `extension-links.html` metadata file (includes official Chrome + Firefox listing URLs)
-
-Extension listing sources:
-
-- Required: `integrations/chrome-beamng-manager/official_listing_url.txt`
-- Required: `integrations/firefox-beamng-manager/official_listing_url.txt`
-- The release flow uses official listing URLs only.
+- The workflow builds the GUI EXE and uploads:
+  - `BeamNG-Manager-<version>-windows-x64.zip` + SHA256
+  - `BeamNG-Manager-<version>-windows-x64.exe` + SHA256
+- Browser extensions are distributed through their store listings (not packaged as release assets).
 
 ## First Launch
 

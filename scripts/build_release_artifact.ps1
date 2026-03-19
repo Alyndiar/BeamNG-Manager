@@ -2,7 +2,8 @@ param(
     [ValidateSet("gui", "debug")]
     [string]$Variant = "gui",
     [string]$Version = "dev",
-    [string]$CondaEnv = "BeamNG-Manager"
+    [string]$CondaEnv = "BeamNG-Manager",
+    [switch]$IncludeRawExe
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,3 +69,18 @@ $ShaPath = "$ZipPath.sha256"
 
 Write-Host "Created: $ZipPath"
 Write-Host "Checksum: $ShaPath"
+
+if ($IncludeRawExe) {
+    $RawExePath = Join-Path $ReleaseDir "$ArtifactBase.exe"
+    if (Test-Path $RawExePath) {
+        Remove-Item -Force $RawExePath
+    }
+    Copy-Item -LiteralPath $ExePath -Destination $RawExePath -Force
+
+    $RawHash = (Get-FileHash -Algorithm SHA256 $RawExePath).Hash.ToLowerInvariant()
+    $RawShaPath = "$RawExePath.sha256"
+    "$RawHash *$(Split-Path -Leaf $RawExePath)" | Set-Content -Path $RawShaPath -Encoding Ascii
+
+    Write-Host "Created: $RawExePath"
+    Write-Host "Checksum: $RawShaPath"
+}
