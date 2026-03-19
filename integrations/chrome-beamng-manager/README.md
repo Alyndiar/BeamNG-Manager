@@ -14,6 +14,10 @@ It uses the same localhost bridge protocol as the Firefox extension:
 
 When BeamNG-Manager queues an open command, the extension drains it from `/commands/next` and opens a new tab.
 
+## Install (official listing)
+
+- Chrome Web Store: <https://chromewebstore.google.com/detail/hhilmajldhikjnjeafjfihpnkmbodggh>
+
 ## Install (developer/unpacked)
 
 1. Open Chrome `chrome://extensions`.

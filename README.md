@@ -1,5 +1,8 @@
 # BeamNG Mod Pack Manager
 
+[Repository](https://github.com/Alyndiar/BeamNG-Manager)
+[Latest Release](https://github.com/Alyndiar/BeamNG-Manager/releases/latest)
+
 Windows desktop mod manager for BeamNG.drive, focused on local mod organization, pack workflows, and safe active-state sync.
 
 ## Current Product State
@@ -142,13 +145,13 @@ GitHub releases:
   - Chrome bridge ZIP
   - Firefox unsigned XPI
   - SHA256 files
-  - `extension-links.html` metadata file (includes the current Firefox unpublished download link)
+  - `extension-links.html` metadata file (includes official Chrome + Firefox listing URLs)
 
-Firefox unpublished link source:
+Extension listing sources:
 
-- Preferred: `integrations/firefox-beamng-manager/official_listing_url.txt`
-- Fallback (if unpublished): `integrations/firefox-beamng-manager/latest_unpublished_download_url.txt`
-- If using the unpublished direct download link and Firefox extension `manifest.json` version changes, the link must be updated to the matching version before release.
+- Required: `integrations/chrome-beamng-manager/official_listing_url.txt`
+- Required: `integrations/firefox-beamng-manager/official_listing_url.txt`
+- The release flow uses official listing URLs only.
 
 ## First Launch
 

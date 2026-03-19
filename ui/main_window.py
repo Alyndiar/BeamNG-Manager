@@ -584,6 +584,7 @@ class MainWindow(QMainWindow):
         self._icon_source_pixmap_by_path: dict[str, QPixmap] = {}
         self._mod_prefix_by_path: dict[str, str] = {}
         self._mod_info_label_by_path: dict[str, str] = {}
+        self._mod_has_info_json_by_path: dict[str, bool] = {}
         self._mod_category_by_path: dict[str, str] = {}
         self._db_mod_data_by_fullpath: dict[str, dict[str, object]] = {}
         self.mods_sort_mode = str(self.settings_store.value("mods_sort_mode", "name", str) or "name")
@@ -1748,6 +1749,12 @@ class MainWindow(QMainWindow):
 
     def _on_icon_columns_changed(self, _value: int) -> None:
         self._schedule_icon_grid_metrics_update()
+        columns = max(1, int(self.columns_slider.value()))
+        for dialog in list(self._info_json_viewers):
+            try:
+                dialog.set_message_image_columns(columns)
+            except (RuntimeError, TypeError):
+                continue
         self._persist_view_preferences()
 
     def _on_info_caption_toggle(self, checked: bool) -> None:
@@ -1797,6 +1804,7 @@ class MainWindow(QMainWindow):
             self._mod_prefix_by_path[path_key] = self._extract_prefix_value(analysis.summary_fields)
             self._mod_category_by_path[path_key] = self._repo_category_badge_label(mod, analysis)
             self._mod_info_label_by_path[path_key] = self._sort_info_label_for_analysis(analysis, mod.path.name)
+            self._mod_has_info_json_by_path[path_key] = bool(analysis.exists)
 
     def _sorted_mod_entries(self, mods: list[ModEntry]) -> list[ModEntry]:
         mode = self._normalized_sort_mode(self.mods_sort_mode)
@@ -1940,6 +1948,10 @@ class MainWindow(QMainWindow):
                 if category_badge is not None and category_badge.isVisible():
                     category_badge.adjustSize()
                     category_badge.move(max(6, preview_width - category_badge.width() - 6), 6)
+                metadata_btn = holder.findChild(QToolButton, "metadata_indicator_btn")
+                if metadata_btn is not None and metadata_btn.isVisible():
+                    metadata_btn.adjustSize()
+                    metadata_btn.move(6, max(6, image_height - metadata_btn.height() - 6))
                 active_btn = holder.findChild(QToolButton, "active_indicator_btn")
                 if active_btn is not None:
                     active_btn.move(6, 6)
@@ -2401,6 +2413,32 @@ class MainWindow(QMainWindow):
         category_badge.move(max(6, image_width - category_badge.width() - 10), 6)
         category_badge.raise_()
 
+        metadata_btn = QToolButton(image_container)
+        metadata_btn.setObjectName("metadata_indicator_btn")
+        metadata_btn.setText("i")
+        metadata_btn.setToolTip("Open metadata")
+        metadata_btn.setAutoRaise(True)
+        metadata_btn.setCursor(Qt.PointingHandCursor)
+        metadata_btn.setFixedSize(_ICON_ACTIVE_INDICATOR_SIZE, _ICON_ACTIVE_INDICATOR_SIZE)
+        metadata_btn.setStyleSheet(
+            "QToolButton#metadata_indicator_btn { "
+            "background: rgba(0,0,0,0.58); "
+            "color: #f0f0f0; "
+            "border: 1px solid #6f6f6f; "
+            "border-radius: 11px; "
+            "font-weight: 700; "
+            "padding: 0px; "
+            "}"
+            "QToolButton#metadata_indicator_btn:hover { "
+            "border-color: #b8d7ff; "
+            "color: #b8d7ff; "
+            "}"
+        )
+        metadata_btn.setVisible(bool(self._mod_has_info_json_by_path.get(str(mod.path), False)))
+        metadata_btn.move(6, max(6, image_height - metadata_btn.height() - 6))
+        metadata_btn.raise_()
+        metadata_btn.clicked.connect(lambda _checked=False, p=mod.path: self._open_info_json_viewer(p))
+
         name_label = ElidedLabel(parent=holder)
         name_label.setObjectName("icon_name_label")
         name_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -2479,6 +2517,10 @@ class MainWindow(QMainWindow):
                     continue
                 self._set_icon_prefix_badge_for_mod(mod.path, self._mod_prefix_by_path.get(str(mod.path), ""))
                 self._set_icon_category_badge_for_mod(mod.path, self._mod_category_by_path.get(str(mod.path), ""))
+                self._set_icon_metadata_indicator_for_mod(
+                    mod.path,
+                    bool(self._mod_has_info_json_by_path.get(str(mod.path), False)),
+                )
                 image_label = holder.findChild(QLabel, "preview_image_label")
                 if image_label is not None:
                     target_size = QSize(max(1, image_label.width()), max(1, image_label.height()))
@@ -3091,6 +3133,22 @@ class MainWindow(QMainWindow):
         y = 6
         badge.move(x, y)
         badge.raise_()
+
+    def _set_icon_metadata_indicator_for_mod(self, mod_path: Path, has_info_json: bool) -> None:
+        holder = self._icon_holder_by_path.get(str(mod_path))
+        if holder is None:
+            return
+        button = holder.findChild(QToolButton, "metadata_indicator_btn")
+        image_label = holder.findChild(QLabel, "preview_image_label")
+        if button is None or image_label is None:
+            return
+        visible = bool(has_info_json)
+        button.setVisible(visible)
+        if not visible:
+            return
+        button.adjustSize()
+        button.move(6, max(6, image_label.height() - button.height() - 6))
+        button.raise_()
 
     def _apply_mod_active_to_views(self, mod_path: Path, active: bool) -> None:
         self._set_table_check_state_for_mod(mod_path, active)
@@ -3856,7 +3914,7 @@ class MainWindow(QMainWindow):
         self._set_background_status_line3_progress(f"Loading mod metadata... 0/{total}")
 
         def _worker_fn(progress_emit):
-            batch: list[tuple[str, str, str, str, int, int]] = []
+            batch: list[tuple[str, str, str, str, bool, int, int]] = []
             for idx, mod in enumerate(mods, start=1):
                 if info_token != self._table_info_token or table_token != self._table_population_token:
                     return total
@@ -3864,7 +3922,7 @@ class MainWindow(QMainWindow):
                 prefix = self._extract_prefix_value(analysis.summary_fields)
                 category = self._repo_category_badge_label(mod, analysis)
                 info_label = self._sort_info_label_for_analysis(analysis, mod.path.name)
-                batch.append((str(mod.path), prefix, category, info_label, idx, total))
+                batch.append((str(mod.path), prefix, category, info_label, bool(analysis.exists), idx, total))
                 if len(batch) >= _TABLE_INFO_BATCH_SIZE:
                     progress_emit(batch)
                     batch = []
@@ -3890,9 +3948,9 @@ class MainWindow(QMainWindow):
         self._updating_mod_table = True
         try:
             for item in payload:
-                if not isinstance(item, tuple) or len(item) != 6:
+                if not isinstance(item, tuple) or len(item) != 7:
                     continue
-                path_raw, prefix, category, info_label, idx, total_count = item
+                path_raw, prefix, category, info_label, has_info_json, idx, total_count = item
                 row = self._mod_row_by_path.get(str(path_raw))
                 if row is None or row >= self.mods_table.rowCount():
                     continue
@@ -3902,6 +3960,7 @@ class MainWindow(QMainWindow):
                 self._mod_prefix_by_path[str(path_raw)] = prefix_text
                 self._mod_category_by_path[str(path_raw)] = category_text
                 self._mod_info_label_by_path[str(path_raw)] = str(info_label).strip()
+                self._mod_has_info_json_by_path[str(path_raw)] = bool(has_info_json)
                 tags_cell = self.mods_table.item(row, 1)
                 if tags_cell is not None:
                     tags_cell.setText(prefix_text)
@@ -3913,6 +3972,7 @@ class MainWindow(QMainWindow):
                     name_cell.setText(self._display_mod_name_for_table(str(path_raw), mod_path.name))
                 self._set_icon_prefix_badge_for_mod(mod_path, prefix_text)
                 self._set_icon_category_badge_for_mod(mod_path, category_text)
+                self._set_icon_metadata_indicator_for_mod(mod_path, bool(has_info_json))
                 last_index = max(last_index, int(idx))
                 total = max(total, int(total_count))
         finally:
@@ -3999,6 +4059,8 @@ class MainWindow(QMainWindow):
         self._start_worker(worker)
 
     def _on_mod_info_ready(self, mod_path: Path, analysis) -> None:
+        self._mod_has_info_json_by_path[str(mod_path)] = bool(analysis.exists)
+        self._set_icon_metadata_indicator_for_mod(mod_path, bool(analysis.exists))
         if self.current_mod_path != mod_path:
             return
 
@@ -4452,7 +4514,13 @@ class MainWindow(QMainWindow):
         self._start_worker(worker)
 
     def _on_info_json_viewer_ready(self, mod_path: Path, analysis) -> None:
-        dialog = InfoJsonViewerDialog(mod_path.name, mod_path, analysis, self)
+        dialog = InfoJsonViewerDialog(
+            mod_path.name,
+            mod_path,
+            analysis,
+            image_columns=max(1, int(self.columns_slider.value())),
+            parent=self,
+        )
         self._info_json_viewers.append(dialog)
         dialog.destroyed.connect(lambda *_args, dlg=dialog: self._drop_info_json_viewer_ref(dlg))
         dialog.show()

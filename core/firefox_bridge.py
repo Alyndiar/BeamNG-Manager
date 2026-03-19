@@ -5,14 +5,37 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
+
+from core.utils import resource_root_dir
 
 
 MarkersProvider = Callable[[], tuple[set[str], set[str], set[str], set[str]]]
 DebugLogger = Callable[[str], None]
 _BRIDGE_PROTOCOL_VERSION = 2
-_EXPECTED_EXTENSION_VERSION = "0.1.8"
+
+
+def _expected_extension_version_from_manifests() -> str:
+    root = resource_root_dir()
+    manifest_paths = (
+        root / "integrations" / "manifest.base.json",
+        root / "integrations" / "firefox-beamng-manager" / "manifest.json",
+    )
+    for manifest_path in manifest_paths:
+        version = _read_extension_manifest_version(manifest_path)
+        if version:
+            return version
+    return "unknown"
+
+
+def _read_extension_manifest_version(manifest_path: Path) -> str:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("version") or "").strip()
 
 
 class FirefoxBridgeServer:
@@ -23,7 +46,7 @@ class FirefoxBridgeServer:
         port: int = 49441,
         debug_enabled: bool = False,
         debug_logger: DebugLogger | None = None,
-        expected_extension_version: str = _EXPECTED_EXTENSION_VERSION,
+        expected_extension_version: str | None = None,
     ) -> None:
         self._markers_provider = markers_provider
         self._host = host
@@ -40,7 +63,9 @@ class FirefoxBridgeServer:
         self._session_id = uuid.uuid4().hex
         self._debug_enabled = bool(debug_enabled)
         self._debug_logger = debug_logger
-        self._expected_extension_version = str(expected_extension_version or _EXPECTED_EXTENSION_VERSION).strip()
+        self._expected_extension_version = (
+            str(expected_extension_version or "").strip() or _expected_extension_version_from_manifests()
+        )
         self._current_extension_version = ""
 
     def set_debug_enabled(self, enabled: bool) -> None:

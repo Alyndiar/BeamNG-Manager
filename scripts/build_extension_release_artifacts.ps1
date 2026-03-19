@@ -25,55 +25,37 @@ if ($LASTEXITCODE -ne 0) {
 
 $chromeManifestPath = Join-Path $RepoRoot "integrations\chrome-beamng-manager\manifest.json"
 $firefoxManifestPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\manifest.json"
+$chromeOfficialLinkPath = Join-Path $RepoRoot "integrations\chrome-beamng-manager\official_listing_url.txt"
 $firefoxOfficialLinkPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\official_listing_url.txt"
-$firefoxDownloadLinkPath = Join-Path $RepoRoot "integrations\firefox-beamng-manager\latest_unpublished_download_url.txt"
 
 $chromeVersion = [string]((Get-Content -LiteralPath $chromeManifestPath -Raw | ConvertFrom-Json).version)
 $firefoxVersion = [string]((Get-Content -LiteralPath $firefoxManifestPath -Raw | ConvertFrom-Json).version)
 if ([string]::IsNullOrWhiteSpace($chromeVersion) -or [string]::IsNullOrWhiteSpace($firefoxVersion)) {
     throw "Missing extension version in one or more extension manifest files."
 }
-
-$firefoxPublicLink = ""
-$firefoxPublicLinkLabel = ""
-$usingUnpublishedLink = $false
-
-if (Test-Path -LiteralPath $firefoxOfficialLinkPath) {
-    $firefoxPublicLink = (Get-Content -LiteralPath $firefoxOfficialLinkPath -Raw).Trim()
-    if (-not [string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
-        $firefoxPublicLinkLabel = "Firefox official listing"
-    }
+if ($chromeVersion -ne $firefoxVersion) {
+    throw "Chrome extension version ($chromeVersion) must match Firefox extension version ($firefoxVersion)."
 }
 
+if (-not (Test-Path -LiteralPath $chromeOfficialLinkPath)) {
+    throw "Missing Chrome official listing URL file: $chromeOfficialLinkPath"
+}
+
+$chromePublicLink = (Get-Content -LiteralPath $chromeOfficialLinkPath -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($chromePublicLink)) {
+    throw "Chrome official listing URL is empty in: $chromeOfficialLinkPath"
+}
+$chromePublicLinkLabel = "Chrome Web Store listing"
+
+if (-not (Test-Path -LiteralPath $firefoxOfficialLinkPath)) {
+    throw "Missing Firefox official listing URL file: $firefoxOfficialLinkPath"
+}
+
+$firefoxPublicLink = (Get-Content -LiteralPath $firefoxOfficialLinkPath -Raw).Trim()
 if ([string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
-    if (-not (Test-Path -LiteralPath $firefoxDownloadLinkPath)) {
-        throw "Missing Firefox extension link file. Expected one of: $firefoxOfficialLinkPath or $firefoxDownloadLinkPath"
-    }
-    $firefoxPublicLink = (Get-Content -LiteralPath $firefoxDownloadLinkPath -Raw).Trim()
-    if ([string]::IsNullOrWhiteSpace($firefoxPublicLink)) {
-        throw "Firefox extension link is empty in: $firefoxDownloadLinkPath"
-    }
-    $firefoxPublicLinkLabel = "Firefox unpublished direct download"
-    $usingUnpublishedLink = $true
+    throw "Firefox official listing URL is empty in: $firefoxOfficialLinkPath"
 }
-
-if ($usingUnpublishedLink) {
-    $linkVersion = ""
-    $match = [System.Text.RegularExpressions.Regex]::Match(
-        $firefoxPublicLink,
-        "beamng_manager_bridge-(?<version>\d+\.\d+\.\d+)\.xpi",
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-    if ($match.Success) {
-        $linkVersion = [string]$match.Groups["version"].Value
-    }
-    if (-not [string]::IsNullOrWhiteSpace($linkVersion) -and $linkVersion -ne $firefoxVersion) {
-        throw (
-            "Firefox extension manifest is $firefoxVersion but configured unpublished AMO link is $linkVersion. " +
-            "Please provide the updated AMO download URL before release."
-        )
-    }
-}
+$firefoxPublicLinkLabel = "Firefox official listing"
 
 & powershell -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "integrations\chrome-beamng-manager\package_zip.ps1") -OutputDir $extensionsDir
 if ($LASTEXITCODE -ne 0) {
@@ -116,7 +98,8 @@ $html = @"
   <body>
     <h1>Extension Links</h1>
     <ul>
-      <li>Chrome: use the attached ZIP artifact (<code>$chromeZipName</code>) with Developer Mode / Load unpacked.</li>
+      <li>${chromePublicLinkLabel}: <a href="$chromePublicLink">$chromePublicLink</a></li>
+      <li>Chrome unpacked package artifact: <code>$chromeZipName</code></li>
       <li>${firefoxPublicLinkLabel}: <a href="$firefoxPublicLink">$firefoxPublicLink</a></li>
     </ul>
   </body>

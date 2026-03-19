@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 from core.cache import ModInfoCache
@@ -105,6 +106,19 @@ def test_analyze_info_json_recovered_and_clean_message(tmp_path: Path) -> None:
     assert analysis.message_html is not None
     assert "<b>Hello</b>" in analysis.message_html
     assert "[Attachment: 751327]" in analysis.message_html
+    assert 'href="https://www.beamng.com/attachments/image-png.751327/"' in analysis.message_html
+
+
+def test_analyze_info_json_message_html_converts_attach_full_tags_to_beamng_links(tmp_path: Path) -> None:
+    mod_zip = tmp_path / "attach-full.zip"
+    payload = {"message": "[ATTACH=full]123456[/ATTACH]"}
+    _write_zip(mod_zip, {"info.json": json.dumps(payload)})
+
+    analysis = analyze_info_json(mod_zip)
+    assert analysis.message_clean == "[Attachment: 123456]"
+    assert analysis.message_html is not None
+    assert 'href="https://www.beamng.com/attachments/image-png.123456/"' in analysis.message_html
+    assert 'data-linked-image="1"' in analysis.message_html
 
 
 def test_analyze_info_json_message_html_formats_common_bbcode(tmp_path: Path) -> None:
@@ -114,7 +128,9 @@ def test_analyze_info_json_message_html_formats_common_bbcode(tmp_path: Path) ->
             "[B]Bold[/B] [I]Italic[/I] [U]Under[/U]\n"
             "[COLOR=#ff0000]Red[/COLOR]\n"
             "[SIZE=20]Big[/SIZE]\n"
+            "[SPOILER]Hidden[/SPOILER]\n"
             "[URL=https://example.com]Example[/URL]\n"
+            "https://pp.userapi.com/c855720/v855720001/example.jpg\n"
             "[LIST][*]One[*]Two[/LIST]"
         )
     }
@@ -126,9 +142,50 @@ def test_analyze_info_json_message_html_formats_common_bbcode(tmp_path: Path) ->
     assert "<i>Italic</i>" in analysis.message_html
     assert "<u>Under</u>" in analysis.message_html
     assert 'color:#ff0000' in analysis.message_html
-    assert 'font-size:20px' in analysis.message_html
+    assert 'font-size:1.25em' in analysis.message_html
+    assert 'border:0.0625em solid #8f8f8f' in analysis.message_html
     assert 'href="https://example.com"' in analysis.message_html
+    assert "pp.userapi.com" not in analysis.message_html
+    assert "pp.userapi.com" not in (analysis.message_clean or "")
     assert "<ul><li>One</li><li>Two</li></ul>" in analysis.message_html
+    assert "px" not in analysis.message_html
+
+
+def test_analyze_info_json_message_html_normalizes_raw_html_links(tmp_path: Path) -> None:
+    mod_zip = tmp_path / "html-links.zip"
+    payload = {
+        "message": (
+            '<a href="https://pp.userapi.com/c855720/v855720001/example.jpg">'
+            "https://pp.userapi.com/c855720/v855720001/example.jpg"
+            "</a><br>"
+            '<a href="https://pp.userapi.com/c855720/v855720001/example2.jpg">second</a>'
+        )
+    }
+    _write_zip(mod_zip, {"info.json": json.dumps(payload)})
+
+    analysis = analyze_info_json(mod_zip)
+    assert analysis.message_html is not None
+    assert '&lt;a href=' not in analysis.message_html
+    assert "pp.userapi.com" not in analysis.message_html
+    assert "second" not in analysis.message_html
+
+
+def test_analyze_info_json_message_html_converts_img_tags_to_clickable_links(tmp_path: Path) -> None:
+    mod_zip = tmp_path / "img-tags.zip"
+    payload = {
+        "message": (
+            "[IMG]https://pp.userapi.com/c637321/v637321668/5515a/X4YRUwRrR9Y.jpg[/IMG] "
+            "[IMG]https://pp.userapi.com/c637321/v637321668/55164/t6oqXcc6GkQ.jpg[/IMG]\n"
+            "[B]Features:[/B]"
+        )
+    }
+    _write_zip(mod_zip, {"info.json": json.dumps(payload)})
+
+    analysis = analyze_info_json(mod_zip)
+    assert analysis.message_html is not None
+    assert "pp.userapi.com" not in analysis.message_html
+    assert 'data-linked-image="1"' not in analysis.message_html
+    assert "<b>Features:</b>" in analysis.message_html
 
 
 def test_analyze_info_json_invalid_keeps_raw_text(tmp_path: Path) -> None:
@@ -175,3 +232,35 @@ def test_mod_info_cache_persists_between_instances(tmp_path: Path) -> None:
     assert second.path == first.path
     assert second.status == first.status
     assert second.message_clean == "ready"
+
+
+def test_info_json_cached_analysis_rebuilds_stale_message_html(tmp_path: Path) -> None:
+    mod_zip = tmp_path / "stale-cache.zip"
+    message = "[IMG]https://pp.userapi.com/c637321/v637321668/5515a/X4YRUwRrR9Y.jpg[/IMG]"
+    _write_zip(mod_zip, {"info.json": json.dumps({"title": "Stale", "message": message})})
+
+    cache = ModInfoCache()
+    fresh = analyze_info_json(mod_zip)
+    stale = replace(fresh, message_html="<div>https://pp.userapi.com/c637321/v637321668/5515a/X4YRUwRrR9Y.jpg</div>")
+    cache.put_analysis(mod_zip, stale, stale.summary_fields)
+
+    rebuilt = get_info_json_analysis_cached(mod_zip, cache)
+    assert rebuilt.message_html is not None
+    assert rebuilt is not stale
+    assert "pp.userapi.com" not in rebuilt.message_html
+
+
+def test_info_json_cached_analysis_rebuilds_stale_attach_placeholder_html(tmp_path: Path) -> None:
+    mod_zip = tmp_path / "stale-attach-cache.zip"
+    message = "[ATTACH]751327[/ATTACH]"
+    _write_zip(mod_zip, {"info.json": json.dumps({"title": "Attach", "message": message})})
+
+    cache = ModInfoCache()
+    fresh = analyze_info_json(mod_zip)
+    stale = replace(fresh, message_html="<div><span>[Attachment: 751327]</span></div>")
+    cache.put_analysis(mod_zip, stale, stale.summary_fields)
+
+    rebuilt = get_info_json_analysis_cached(mod_zip, cache)
+    assert rebuilt.message_html is not None
+    assert rebuilt is not stale
+    assert 'href="https://www.beamng.com/attachments/image-png.751327/"' in rebuilt.message_html
